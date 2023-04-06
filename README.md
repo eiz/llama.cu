@@ -9,7 +9,7 @@ To build:
 * Have CMake >= 3.17 and Make or Ninja (if you're using Ninja, you know what to do different)
 * `mkdir build && (cd build && cmake .. && make)`
 * Download/extract [filthy_instruct_v6](https://f000.backblazeb2.com/file/unaligned-ai/filthy_instruct_v6_extracted.tar). It should extract to `models/filthy_instruct_v6` relative to the llama.cu directory. If you have access to the original LLaMA weights, you can go figure out how to extract them using `extract.py`. glhf
-* `./build/llama_cu 4 filthy_instruct_v6 "My cool prompt"`
+* `./build/llama_cu 4 filthy_instruct_v6 "List of top 10 entertaining cat facts:"`
 * If you want it to run a bit faster, define `ENABLE_CUBLAS` in `main.cu` and change the `4` to `0`
 
 There's some big TODOs right now:
