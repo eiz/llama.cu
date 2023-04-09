@@ -1,3 +1,9 @@
 {
-    "python.formatting.provider": "black"
+    "python.formatting.provider": "black",
+    "files.associations": {
+        "format": "cpp",
+        "memory": "cpp",
+        "optional": "cpp",
+        "random": "cpp"
+    }
 }

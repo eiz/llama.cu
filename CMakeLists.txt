@@ -20,4 +20,4 @@ set_target_properties(llama_cu PROPERTIES
 #target_compile_options(llama_cu PRIVATE -g)
 target_include_directories(llama_cu PRIVATE ${CUDA_INCLUDE_DIRS})
 # CUDA::cublas_static CUDA::cublasLt_static
-target_link_libraries(llama_cu ${CUDA_LIBRARIES} CUDA::cublas_static CUDA::cublasLt_static)
+target_link_libraries(llama_cu ${CUDA_LIBRARIES} CUDA::cublas CUDA::cublasLt)

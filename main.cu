@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -11,10 +12,16 @@
 #include <unordered_map>
 #include <vector>
 
-#include <bits/types/struct_timespec.h>
 #include <fcntl.h>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#undef OUT
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 #define ENABLE_CUBLAS
 #ifdef ENABLE_CUBLAS
@@ -39,6 +46,8 @@
   if (!(x)) {            \
     return false;        \
   }
+
+using monoclock = std::chrono::steady_clock;
 
 __device__ __host__ __forceinline__ size_t ceil_div(size_t a, size_t b) {
   return (a + b - 1) / b;
@@ -443,6 +452,22 @@ __global__ void silu(__half* output, __half* lhs, __half* rhs, int size) {
 
 struct mapped_buffer {
   mapped_buffer(std::string const& path) {
+#if defined(_WIN32)
+    // TODO(eiz): support things other than america letters
+    fd_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fd_ == INVALID_HANDLE_VALUE) {
+      return;
+    }
+    size_ = GetFileSize(fd_, nullptr);
+    mapping_ = CreateFileMapping(fd_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (mapping_ == nullptr) {
+      CloseHandle(fd_);
+      fd_ = INVALID_HANDLE_VALUE;
+      return;
+    }
+    ptr_ = MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+#else
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
       return;
@@ -453,43 +478,79 @@ struct mapped_buffer {
     if (ptr_ == MAP_FAILED) {
       ptr_ = nullptr;
     }
+#endif
   }
   mapped_buffer(size_t size) {
+#if defined(_WIN32)
+    mapping_ = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, size, nullptr);
+    if (mapping_ == nullptr) {
+      return;
+    }
+    size_ = size;
+    ptr_ = MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+#else
     size_ = size;
     fd_ = -1;
     ptr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ptr_ == MAP_FAILED) {
       ptr_ = nullptr;
     }
+#endif
   }
   ~mapped_buffer() {
+#if defined(_WIN32)
+    if (ptr_) {
+      UnmapViewOfFile(ptr_);
+    }
+    if (mapping_) {
+      CloseHandle(mapping_);
+    }
+    if (fd_ != INVALID_HANDLE_VALUE) {
+      CloseHandle(fd_);
+    }
+#else
     if (ptr_) {
       munmap(ptr_, size_);
     }
     if (fd_ >= 0) {
       close(fd_);
     }
+#endif
   }
   mapped_buffer(mapped_buffer&& other) {
     fd_ = other.fd_;
     ptr_ = other.ptr_;
     size_ = other.size_;
-    other.fd_ = -1;
+    mapping_ = other.mapping_;
+    other.fd_ = invalid_file;
     other.ptr_ = nullptr;
     other.size_ = 0;
+    other.mapping_ = nullptr;
   }
   mapped_buffer& operator=(mapped_buffer&& other) {
     if (this != &other) {
+#if defined(_WIN32)
+      if (ptr_) {
+        UnmapViewOfFile(ptr_);
+      }
+      if (mapping_) {
+        CloseHandle(mapping_);
+      }
+      if (fd_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(fd_);
+      }
+#else
       if (ptr_) {
         munmap(ptr_, size_);
       }
       if (fd_ >= 0) {
         close(fd_);
       }
+#endif
       fd_ = other.fd_;
       ptr_ = other.ptr_;
       size_ = other.size_;
-      other.fd_ = -1;
+      other.fd_ = invalid_file;
       other.ptr_ = nullptr;
       other.size_ = 0;
     }
@@ -502,7 +563,14 @@ struct mapped_buffer {
  private:
   mapped_buffer(mapped_buffer const&) = delete;
   mapped_buffer& operator=(mapped_buffer const&) = delete;
-  int fd_{-1};
+#if defined(_WIN32)
+  const HANDLE invalid_file = INVALID_HANDLE_VALUE;
+  HANDLE fd_{invalid_file};
+  HANDLE mapping_{nullptr};
+#else
+  const int invalid_file = -1;
+  int fd_{invalid_file};
+#endif
   void* ptr_{nullptr};
   size_t size_{0};
 };
@@ -1237,11 +1305,11 @@ int main(int argc, char const** argv) {
     tokens.push_back(1);
   }
 
-  struct timespec start, end;
-  clock_gettime(CLOCK_MONOTONIC, &start);
+  monoclock::time_point start, end;
+  start = monoclock::now();
   context.next_token(tokens);
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  printf("Time: %f\n", (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9);
+  end = monoclock::now();
+  printf("Time: %f\n", (end - start).count() / 1e9);
 #else
   std::vector<short> tokens = vocab.tokenize(prompt_str, true);
   auto prompt_tokens = tokens.size();
