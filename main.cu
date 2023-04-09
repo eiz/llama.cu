@@ -860,7 +860,6 @@ struct llama_context {
     t_norm_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
     t_xq_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
     t_xk_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
-    t_xv_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
     t_qk_ = tensor4d<__half>(1, model_->params.n_heads, t_embed_.h, t_embed_.h, GUTTER);
     t_out_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
     t_w1_ = tensor4d<__half>(1, 1, t_norm_.h, model_->ffn_dim, GUTTER);
@@ -883,7 +882,6 @@ struct llama_context {
     count += t_norm_.gpu.size();
     count += t_xq_.gpu.size();
     count += t_xk_.gpu.size();
-    count += t_xv_.gpu.size();
     count += t_qk_.gpu.size();
     count += t_out_.gpu.size();
     count += t_w1_.gpu.size();
@@ -896,8 +894,9 @@ struct llama_context {
     assert(new_tokens.size() + start_pos_ <= context_len_);
     auto v_tokens = t_tokens_.view().take(1, 1, 1, new_tokens.size());
     auto v_embed = t_embed_.view().take(1, 1, new_tokens.size(), model_->params.dim);
-    auto v_norm = t_norm_.view().take(v_embed.n, v_embed.c, v_embed.h, v_embed.w);
-    auto v_xq = t_xq_.view().take(v_embed.n, v_embed.c, v_embed.h, v_embed.w);
+    auto v_norm = t_norm_.view().take(1, 1, v_embed.h, v_embed.w);
+    auto v_xq = t_xq_.view().take(1, 1, v_embed.h, v_embed.w);
+    auto v_xk = t_xk_.view().take(1, 1, new_tokens.size() + start_pos_, model_->params.dim);
     // TODO: matmul_qk/qkv need to handle strided access to make this a view
     auto tt_qk = tensor4d<__half>(1, model_->params.n_heads, new_tokens.size(),
                                   new_tokens.size() + start_pos_);
@@ -934,10 +933,9 @@ struct llama_context {
                                             model_->params.n_heads, start_pos_);
       // K
       matmul_nt(v_xk_new, v_norm, model_->layers[cur_layer].wk, 0.0, s_k_);
-      gridDim = dim3(ceil_div(v_xk_new.w, 32), ceil_div(v_xk_new.h, 32));
-      kernel::rotary<<<gridDim, blockDim, 0, s_k_>>>(v_xk_new.data(), v_xk_new.data(), v_xk_new.h,
-                                                     v_xk_new.w, model_->params.n_heads,
-                                                     start_pos_);
+      gridDim = dim3(ceil_div(v_xk.w, 32), ceil_div(v_xk.h, 32));
+      kernel::rotary<<<gridDim, blockDim, 0, s_k_>>>(v_xk.data(), v_xk_full.data(), v_xk_full.h,
+                                                     v_xk_full.w, model_->params.n_heads);
       // V
       matmul_nt(v_xv_new, v_norm, model_->layers[cur_layer].wv, 0.0f, s_v_);
       CHECK_CUDA(cudaEventRecord(e_k_, s_k_));
@@ -946,9 +944,8 @@ struct llama_context {
       CHECK_CUDA(cudaStreamWaitEvent(0, e_v_));
       gridDim = dim3(ceil_div(v_qk.w, 32), ceil_div(v_qk.h, 32), model_->params.n_heads);
       // softmax(QK^T / sqrt(head_dim)) * V
-      kernel::matmul_qk<<<gridDim, blockDim>>>(v_qk.data(), v_xq.data(), v_xk_full.data(), v_xq.h,
-                                               v_xk_full.h, v_xk_full.w, model_->params.n_heads,
-                                               start_pos_);
+      kernel::matmul_qk<<<gridDim, blockDim>>>(v_qk.data(), v_xq.data(), v_xk.data(), v_xq.h,
+                                               v_xk.h, v_xk.w, model_->params.n_heads, start_pos_);
       kernel::softmax_rows<<<dim3(v_qk.h, model_->params.n_heads), 256>>>(v_qk.data(), v_qk.data(),
                                                                           v_qk.h, v_qk.w);
       gridDim = dim3(ceil_div(v_xv_full.w, 32), ceil_div(v_xv_full.h, 32));
@@ -1002,7 +999,6 @@ struct llama_context {
   tensor4d<__half> t_norm_;
   tensor4d<__half> t_xq_;
   tensor4d<__half> t_xk_;
-  tensor4d<__half> t_xv_;
   tensor4d<__half> t_qk_;
   tensor4d<__half> t_out_;
   tensor4d<__half> t_w1_;
