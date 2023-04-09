@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.17)
 
 project(llama_cu LANGUAGES CXX CUDA)
 
+option(ENABLE_CUBLAS "Enable cuBLAS library support" OFF)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -17,7 +19,15 @@ set_target_properties(llama_cu PROPERTIES
     CUDA_ARCHITECTURES "89"
 )
 
-#target_compile_options(llama_cu PRIVATE -g)
 target_include_directories(llama_cu PRIVATE ${CUDA_INCLUDE_DIRS})
-# CUDA::cublas_static CUDA::cublasLt_static
-target_link_libraries(llama_cu ${CUDA_LIBRARIES} CUDA::cublas CUDA::cublasLt)
+
+if(ENABLE_CUBLAS)
+    if (UNIX AND NOT APPLE)
+        message(STATUS "Linking to static cuBLAS library on Linux")
+        target_link_libraries(llama_cu ${CUDA_LIBRARIES} CUDA::cublas_static CUDA::cublasLt_static)
+    elseif (WIN32)
+        message(STATUS "Linking to dynamic cuBLAS library on Windows")
+        target_link_libraries(llama_cu ${CUDA_LIBRARIES} CUDA::cublas CUDA::cublasLt)
+    endif()
+    target_compile_definitions(llama_cu PRIVATE ENABLE_CUBLAS)
+endif()

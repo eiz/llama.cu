@@ -23,7 +23,6 @@
 #include <unistd.h>
 #endif
 
-#define ENABLE_CUBLAS
 #ifdef ENABLE_CUBLAS
 #include <cublas_v2.h>
 #endif
