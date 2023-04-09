@@ -23,6 +23,7 @@
 #include <unistd.h>
 #endif
 
+#define CUDA_API_PER_THREAD_DEFAULT_STREAM
 #ifdef ENABLE_CUBLAS
 #include <cublas_v2.h>
 #endif
@@ -834,9 +835,16 @@ struct llama_context {
     CHECK_CUDA(cudaEventCreate(&e_0_));
     CHECK_CUDA(cudaEventCreate(&e_k_));
     CHECK_CUDA(cudaEventCreate(&e_v_));
-    CHECK_CUDA(cudaStreamCreate(&s_k_));
-    CHECK_CUDA(cudaStreamCreate(&s_v_));
+    CHECK_CUDA(cudaStreamCreateWithFlags(&s_k_, cudaStreamNonBlocking));
+    CHECK_CUDA(cudaStreamCreateWithFlags(&s_v_, cudaStreamNonBlocking));
     reset();
+  }
+  ~llama_context() {
+    CHECK_CUDA(cudaEventDestroy(e_0_));
+    CHECK_CUDA(cudaEventDestroy(e_k_));
+    CHECK_CUDA(cudaEventDestroy(e_v_));
+    CHECK_CUDA(cudaStreamDestroy(s_k_));
+    CHECK_CUDA(cudaStreamDestroy(s_v_));
   }
   void reset() {
     const int GUTTER = 128;
@@ -1184,10 +1192,12 @@ cublasHandle_t cublas_handle;
 void matmul_nt_gemm(tensor4d_view<__half> out,
                     tensor4d_view<__half> lhs,
                     tensor4d_view<__half> rhs,
-                    __half beta) {
+                    __half beta,
+                    cudaStream_t stream) {
   int M = out.h, N = out.w, K = lhs.w;
   float fbeta = __half2float(beta);
   float falpha = 1.0f;
+  cublasSetStream(cublas_handle, stream);
   // Because GEMM uses column major, we swap left/right and also swap T/N.
   cublasStatus_t status =
       cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &falpha, rhs.data(),
@@ -1208,7 +1218,7 @@ void matmul_nt(tensor4d_view<__half> out,
   switch (matmul_type) {
 #ifdef ENABLE_CUBLAS
     case 0:
-      matmul_nt_gemm(out, lhs, rhs, beta);
+      matmul_nt_gemm(out, lhs, rhs, beta, stream);
       break;
 #endif
     case 1: {
