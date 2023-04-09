@@ -11,11 +11,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include <bits/types/struct_timespec.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
-#undef ENABLE_CUBLAS
+#define ENABLE_CUBLAS
 #ifdef ENABLE_CUBLAS
 #include <cublas_v2.h>
 #endif
@@ -1228,6 +1229,20 @@ int main(int argc, char const** argv) {
 #endif
   llama_context context(&model, 2048, 0.8);
   printf("Context memory: %f MB\n", context.context_memory_usage() / 1024.0 / 1024.0);
+#define BENCH
+#ifdef BENCH
+  std::vector<short> tokens;
+
+  for (int i = 0; i < 2048; ++i) {
+    tokens.push_back(1);
+  }
+
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  context.next_token(tokens);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  printf("Time: %f\n", (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9);
+#else
   std::vector<short> tokens = vocab.tokenize(prompt_str, true);
   auto prompt_tokens = tokens.size();
   struct timespec start, end;
@@ -1267,5 +1282,6 @@ int main(int argc, char const** argv) {
     fprintf(fp, "%f\n", time);
   }
   fclose(fp);
+#endif
   return 0;
 }
