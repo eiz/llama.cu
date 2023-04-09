@@ -3,3 +3,4 @@ CompileFlags:
     - -forward-unknown-to-host-compiler
     - --generate-code*
     - -rdc=true
+    - --options-file

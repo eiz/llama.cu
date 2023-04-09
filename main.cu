@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -12,10 +13,17 @@
 #include <vector>
 
 #include <fcntl.h>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#undef OUT
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
-#undef ENABLE_CUBLAS
+#define CUDA_API_PER_THREAD_DEFAULT_STREAM
 #ifdef ENABLE_CUBLAS
 #include <cublas_v2.h>
 #endif
@@ -38,6 +46,8 @@
   if (!(x)) {            \
     return false;        \
   }
+
+using monoclock = std::chrono::steady_clock;
 
 __device__ __host__ __forceinline__ size_t ceil_div(size_t a, size_t b) {
   return (a + b - 1) / b;
@@ -442,6 +452,22 @@ __global__ void silu(__half* output, __half* lhs, __half* rhs, int size) {
 
 struct mapped_buffer {
   mapped_buffer(std::string const& path) {
+#if defined(_WIN32)
+    // TODO(eiz): support things other than america letters
+    fd_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fd_ == INVALID_HANDLE_VALUE) {
+      return;
+    }
+    size_ = GetFileSize(fd_, nullptr);
+    mapping_ = CreateFileMapping(fd_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (mapping_ == nullptr) {
+      CloseHandle(fd_);
+      fd_ = INVALID_HANDLE_VALUE;
+      return;
+    }
+    ptr_ = MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+#else
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
       return;
@@ -452,43 +478,79 @@ struct mapped_buffer {
     if (ptr_ == MAP_FAILED) {
       ptr_ = nullptr;
     }
+#endif
   }
   mapped_buffer(size_t size) {
+#if defined(_WIN32)
+    mapping_ = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, size, nullptr);
+    if (mapping_ == nullptr) {
+      return;
+    }
+    size_ = size;
+    ptr_ = MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+#else
     size_ = size;
     fd_ = -1;
     ptr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ptr_ == MAP_FAILED) {
       ptr_ = nullptr;
     }
+#endif
   }
   ~mapped_buffer() {
+#if defined(_WIN32)
+    if (ptr_) {
+      UnmapViewOfFile(ptr_);
+    }
+    if (mapping_) {
+      CloseHandle(mapping_);
+    }
+    if (fd_ != INVALID_HANDLE_VALUE) {
+      CloseHandle(fd_);
+    }
+#else
     if (ptr_) {
       munmap(ptr_, size_);
     }
     if (fd_ >= 0) {
       close(fd_);
     }
+#endif
   }
   mapped_buffer(mapped_buffer&& other) {
     fd_ = other.fd_;
     ptr_ = other.ptr_;
     size_ = other.size_;
-    other.fd_ = -1;
+    mapping_ = other.mapping_;
+    other.fd_ = invalid_file;
     other.ptr_ = nullptr;
     other.size_ = 0;
+    other.mapping_ = nullptr;
   }
   mapped_buffer& operator=(mapped_buffer&& other) {
     if (this != &other) {
+#if defined(_WIN32)
+      if (ptr_) {
+        UnmapViewOfFile(ptr_);
+      }
+      if (mapping_) {
+        CloseHandle(mapping_);
+      }
+      if (fd_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(fd_);
+      }
+#else
       if (ptr_) {
         munmap(ptr_, size_);
       }
       if (fd_ >= 0) {
         close(fd_);
       }
+#endif
       fd_ = other.fd_;
       ptr_ = other.ptr_;
       size_ = other.size_;
-      other.fd_ = -1;
+      other.fd_ = invalid_file;
       other.ptr_ = nullptr;
       other.size_ = 0;
     }
@@ -501,7 +563,14 @@ struct mapped_buffer {
  private:
   mapped_buffer(mapped_buffer const&) = delete;
   mapped_buffer& operator=(mapped_buffer const&) = delete;
-  int fd_{-1};
+#if defined(_WIN32)
+  const HANDLE invalid_file = INVALID_HANDLE_VALUE;
+  HANDLE fd_{invalid_file};
+  HANDLE mapping_{nullptr};
+#else
+  const int invalid_file = -1;
+  int fd_{invalid_file};
+#endif
   void* ptr_{nullptr};
   size_t size_{0};
 };
@@ -766,9 +835,16 @@ struct llama_context {
     CHECK_CUDA(cudaEventCreate(&e_0_));
     CHECK_CUDA(cudaEventCreate(&e_k_));
     CHECK_CUDA(cudaEventCreate(&e_v_));
-    CHECK_CUDA(cudaStreamCreate(&s_k_));
-    CHECK_CUDA(cudaStreamCreate(&s_v_));
+    CHECK_CUDA(cudaStreamCreateWithFlags(&s_k_, cudaStreamNonBlocking));
+    CHECK_CUDA(cudaStreamCreateWithFlags(&s_v_, cudaStreamNonBlocking));
     reset();
+  }
+  ~llama_context() {
+    CHECK_CUDA(cudaEventDestroy(e_0_));
+    CHECK_CUDA(cudaEventDestroy(e_k_));
+    CHECK_CUDA(cudaEventDestroy(e_v_));
+    CHECK_CUDA(cudaStreamDestroy(s_k_));
+    CHECK_CUDA(cudaStreamDestroy(s_v_));
   }
   void reset() {
     const int GUTTER = 128;
@@ -1116,10 +1192,12 @@ cublasHandle_t cublas_handle;
 void matmul_nt_gemm(tensor4d_view<__half> out,
                     tensor4d_view<__half> lhs,
                     tensor4d_view<__half> rhs,
-                    __half beta) {
+                    __half beta,
+                    cudaStream_t stream) {
   int M = out.h, N = out.w, K = lhs.w;
   float fbeta = __half2float(beta);
   float falpha = 1.0f;
+  cublasSetStream(cublas_handle, stream);
   // Because GEMM uses column major, we swap left/right and also swap T/N.
   cublasStatus_t status =
       cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &falpha, rhs.data(),
@@ -1140,7 +1218,7 @@ void matmul_nt(tensor4d_view<__half> out,
   switch (matmul_type) {
 #ifdef ENABLE_CUBLAS
     case 0:
-      matmul_nt_gemm(out, lhs, rhs, beta);
+      matmul_nt_gemm(out, lhs, rhs, beta, stream);
       break;
 #endif
     case 1: {
@@ -1228,23 +1306,36 @@ int main(int argc, char const** argv) {
 #endif
   llama_context context(&model, 2048, 0.8);
   printf("Context memory: %f MB\n", context.context_memory_usage() / 1024.0 / 1024.0);
+#ifdef BENCH
+  std::vector<short> tokens;
+
+  for (int i = 0; i < 2048; ++i) {
+    tokens.push_back(1);
+  }
+
+  monoclock::time_point start, end;
+  start = monoclock::now();
+  context.next_token(tokens);
+  end = monoclock::now();
+  printf("Time: %f\n", (end - start).count() / 1e9);
+#else
   std::vector<short> tokens = vocab.tokenize(prompt_str, true);
   auto prompt_tokens = tokens.size();
-  struct timespec start, end;
+  monoclock::time_point start, end;
   int tokens_generated = 0;
   std::vector<float> token_times;
   std::vector<short> complete_tokens = tokens;
-  clock_gettime(CLOCK_MONOTONIC, &start);
+  start = monoclock::now();
   while (true) {
-    struct timespec token_start, token_end;
-    clock_gettime(CLOCK_MONOTONIC, &token_start);
+    monoclock::time_point token_start, token_end;
+    token_start = monoclock::now();
     if (context.tokens_left() == 0) {
       context.reset();
       tokens.clear();
       tokens.insert(tokens.end(), complete_tokens.end() - 1024, complete_tokens.end());
     }
     auto next_token = context.next_token(tokens);
-    clock_gettime(CLOCK_MONOTONIC, &token_end);
+    token_end = monoclock::now();
     if (next_token == 2) {
       break;
     }
@@ -1253,13 +1344,11 @@ int main(int argc, char const** argv) {
     tokens.clear();
     tokens.push_back(next_token);
     complete_tokens.push_back(next_token);
-    token_times.push_back((token_end.tv_sec - token_start.tv_sec) +
-                          (token_end.tv_nsec - token_start.tv_nsec) / 1e9);
+    token_times.push_back((token_end - token_start).count() / 1e9);
     tokens_generated++;
   }
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  printf("\ntokens: %d time: %f\n", tokens_generated,
-         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9);
+  end = monoclock::now();
+  printf("\ntokens: %d time: %f\n", tokens_generated, (end - start).count() / 1e9);
   FILE* fp = fopen("times.txt", "w");
   assert(fp);
   fprintf(fp, "%zu\n", prompt_tokens);
@@ -1267,5 +1356,6 @@ int main(int argc, char const** argv) {
     fprintf(fp, "%f\n", time);
   }
   fclose(fp);
+#endif
   return 0;
 }
