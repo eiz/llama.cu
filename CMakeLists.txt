@@ -7,8 +7,14 @@ option(ENABLE_CUBLAS "Enable cuBLAS library support" OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_FLAGS_RELEASE "-O2 -fno-rtti -fno-exceptions")
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -fno-rtti -fno-exceptions")
+
+if(MSVC)
+    set(CMAKE_CUDA_FLAGS_RELEASE "-O2")
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2")
+else()
+    set(CMAKE_CUDA_FLAGS_RELEASE "-O2 -fno-rtti -fno-exceptions")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O2 -fno-rtti -fno-exceptions")
+endif()
 
 find_package(CUDAToolkit REQUIRED)
 
