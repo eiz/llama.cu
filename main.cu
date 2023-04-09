@@ -1296,7 +1296,6 @@ int main(int argc, char const** argv) {
 #endif
   llama_context context(&model, 2048, 0.8);
   printf("Context memory: %f MB\n", context.context_memory_usage() / 1024.0 / 1024.0);
-#define BENCH
 #ifdef BENCH
   std::vector<short> tokens;
 
@@ -1312,21 +1311,21 @@ int main(int argc, char const** argv) {
 #else
   std::vector<short> tokens = vocab.tokenize(prompt_str, true);
   auto prompt_tokens = tokens.size();
-  struct timespec start, end;
+  monoclock::time_point start, end;
   int tokens_generated = 0;
   std::vector<float> token_times;
   std::vector<short> complete_tokens = tokens;
-  clock_gettime(CLOCK_MONOTONIC, &start);
+  start = monoclock::now();
   while (true) {
-    struct timespec token_start, token_end;
-    clock_gettime(CLOCK_MONOTONIC, &token_start);
+    monoclock::time_point token_start, token_end;
+    token_start = monoclock::now();
     if (context.tokens_left() == 0) {
       context.reset();
       tokens.clear();
       tokens.insert(tokens.end(), complete_tokens.end() - 1024, complete_tokens.end());
     }
     auto next_token = context.next_token(tokens);
-    clock_gettime(CLOCK_MONOTONIC, &token_end);
+    token_end = monoclock::now();
     if (next_token == 2) {
       break;
     }
@@ -1335,13 +1334,11 @@ int main(int argc, char const** argv) {
     tokens.clear();
     tokens.push_back(next_token);
     complete_tokens.push_back(next_token);
-    token_times.push_back((token_end.tv_sec - token_start.tv_sec) +
-                          (token_end.tv_nsec - token_start.tv_nsec) / 1e9);
+    token_times.push_back((token_end - token_start).count() / 1e9);
     tokens_generated++;
   }
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  printf("\ntokens: %d time: %f\n", tokens_generated,
-         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9);
+  end = monoclock::now();
+  printf("\ntokens: %d time: %f\n", tokens_generated, (end - start).count() / 1e9);
   FILE* fp = fopen("times.txt", "w");
   assert(fp);
   fprintf(fp, "%zu\n", prompt_tokens);
