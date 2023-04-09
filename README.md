@@ -4,13 +4,21 @@ This doesn't really serve any purpose other than my personal learning about CUDA
 
 To build:
 
-* Linux (WSL2 works fine)
+Linux:
+
 * Have CUDA toolkit installed and in your PATH (I use 12.0 mainly)
 * Have CMake >= 3.17 and Make or Ninja (if you're using Ninja, you know what to do different)
 * `mkdir build && (cd build && cmake .. && make)`
-* Download/extract [filthy_instruct_v6](https://f000.backblazeb2.com/file/unaligned-ai/filthy_instruct_v6_extracted.tar). It should extract to `models/filthy_instruct_v6` relative to the llama.cu directory. If you have access to the original LLaMA weights, you can go figure out how to extract them using `extract.py`. glhf
+* See below for sample model weights
 * `./build/llama_cu 4 filthy_instruct_v6 "List of top 10 entertaining cat facts:"`
-* If you want it to run a bit faster, define `ENABLE_CUBLAS` in `main.cu` and change the `4` to `0`
+
+Windows:
+
+* Install Visual Studio 2022 (Community is fine) + CUDA Toolkit + CMake >= 3.17
+* Generate VS project with CMake and build.
+* Models are loaded relative to the current working directory, so run it from the parent of your `models/` dir.
+
+On either platform, you can speed things up by setting the `ENABLE_CUBLAS` CMake option.
 
 There's some big TODOs right now:
 
@@ -24,7 +32,6 @@ There's some big TODOs right now:
 * implement a more proper sampler
 * create a proper library interface and tools
 * it currently targets the RTX 4090. You can easily run it on Ampere devices by changing the architecture target, but anything less than 24GB or older than that will fail (either OOM or shared mem size limits). Probably will not bother fixing this until quantization is done.
-* type in the 20 lines of code to port to Windows
 
 The floating point calculations in here are as numerically close to the Meta pytorch implementation as I could get.
 
