@@ -1,3 +1,4 @@
+#undef NDEBUG
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -9,7 +10,9 @@
 #include <queue>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fcntl.h>
@@ -19,6 +22,7 @@
 #include <windows.h>
 #undef OUT
 #else
+#include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -39,7 +43,7 @@
     if (__cuda_status != cudaSuccess) {                                                   \
       fprintf(stderr, "%s(%d): cuda error: %s (source: " #expr ")\n", __func__, __LINE__, \
               cudaGetErrorString(__cuda_status));                                         \
-      abort();                                                                            \
+      raise(SIGSEGV);                                                                     \
     }                                                                                     \
   } while (0)
 #define RETURN_UNLESS(x) \
@@ -521,11 +525,13 @@ struct mapped_buffer {
     fd_ = other.fd_;
     ptr_ = other.ptr_;
     size_ = other.size_;
-    mapping_ = other.mapping_;
     other.fd_ = invalid_file;
     other.ptr_ = nullptr;
     other.size_ = 0;
+#if defined(_WIN32)
+    mapping_ = other.mapping_;
     other.mapping_ = nullptr;
+#endif
   }
   mapped_buffer& operator=(mapped_buffer&& other) {
     if (this != &other) {
@@ -573,6 +579,21 @@ struct mapped_buffer {
 #endif
   void* ptr_{nullptr};
   size_t size_{0};
+};
+
+struct scoped_gpu {
+  scoped_gpu(int device) {
+    CHECK_CUDA(cudaGetDevice(&prev_device_));
+    CHECK_CUDA(cudaSetDevice(device));
+  }
+  ~scoped_gpu() { CHECK_CUDA(cudaSetDevice(prev_device_)); }
+
+ private:
+  scoped_gpu(scoped_gpu const&) = delete;
+  scoped_gpu& operator=(scoped_gpu const&) = delete;
+  scoped_gpu(scoped_gpu&&) = delete;
+  scoped_gpu& operator=(scoped_gpu&&) = delete;
+  int prev_device_;
 };
 
 struct gpu_buffer_view {
@@ -745,6 +766,8 @@ struct llama_layer {
   tensor4d<__half> ffn_norm, attn_norm;
 };
 
+constexpr int GUTTER = 128;
+
 struct llama_params {
   uint32_t dim;
   uint32_t multiple_of;
@@ -752,15 +775,130 @@ struct llama_params {
   uint32_t n_layers;
   uint32_t n_vocab;
   float norm_eps;
+  uint32_t ffn_dim() const { return round_up(dim * 8 / 3, multiple_of); }
+  size_t layer_size() const {
+    size_t attn_weights = 4 * dim * dim * sizeof(__half);
+    size_t norms = 2 * dim * sizeof(__half);
+    size_t ffn_weights = 3 * ffn_dim() * dim * sizeof(__half);
+    return attn_weights + norms + ffn_weights;
+  }
+  size_t embedding_size() const { return n_vocab * dim * sizeof(__half); }
+  size_t output_size() const { return n_vocab * dim * sizeof(__half) + dim * sizeof(__half); }
+  size_t shared_context_memory_size(size_t context_len) const {
+    size_t token_buf_size = context_len * sizeof(short);
+    size_t embed_size = (context_len + GUTTER) * dim * sizeof(__half);
+    size_t norm_size = embed_size;
+    size_t xq_size = embed_size;
+    size_t xk_size = embed_size;
+    size_t qk_size = n_heads * (context_len + GUTTER) * context_len * sizeof(__half);
+    size_t out_size = embed_size;
+    size_t w1_size = (context_len + GUTTER) * ffn_dim() * sizeof(__half);
+    size_t w3_size = w1_size;
+    size_t silu_size = w1_size;
+    size_t logits_size = (1 + GUTTER) * n_vocab * sizeof(__half);
+    return token_buf_size + embed_size + norm_size + xq_size + xk_size + qk_size + out_size +
+           w1_size + w3_size + silu_size + logits_size;
+  }
+  size_t kv_cache_size(size_t context_len) const {
+    return (context_len + GUTTER) * dim * 2 * sizeof(__half);
+  }
+};
+
+struct llama_partition {
+  llama_partition() {}
+  void use_default(llama_params const& params) {
+    used_gpus = {0};
+    embedding_gpu = 0;
+    layer_gpus.clear();
+    for (int i = 0; i < params.n_layers; ++i) {
+      layer_gpus.push_back(0);
+    }
+    output_gpu = 0;
+  }
+  void autopipe(llama_params const& params, size_t context_len) {
+    int cur_gpu = 0;
+    size_t reserved_size = params.shared_context_memory_size(context_len) + 64 * 1024 * 1024;
+    size_t cur_used = reserved_size;
+    embedding_gpu = consume(cur_gpu, cur_used, reserved_size, params.embedding_size());
+    for (int i = 0; i < params.n_layers; ++i) {
+      layer_gpus.push_back(consume(cur_gpu, cur_used, reserved_size,
+                                   params.layer_size() + params.kv_cache_size(context_len)));
+    }
+    output_gpu = consume(cur_gpu, cur_used, reserved_size, params.output_size());
+    std::unordered_set<int> used_gpus_set;
+    for (int i = 0; i < params.n_layers; ++i) {
+      used_gpus_set.insert(layer_gpus[i]);
+    }
+    used_gpus_set.insert(embedding_gpu);
+    used_gpus_set.insert(output_gpu);
+    used_gpus.clear();
+    used_gpus.insert(used_gpus.end(), used_gpus_set.begin(), used_gpus_set.end());
+  }
+  bool is_valid() {
+    if (embedding_gpu == -1 || output_gpu == -1) {
+      return false;
+    }
+    for (int i = 0; i < layer_gpus.size(); ++i) {
+      if (layer_gpus[i] == -1) {
+        return false;
+      }
+    }
+    return true;
+  }
+  void debug_print() {
+    fprintf(stderr, "Model partition:\n");
+    fprintf(stderr, "  Embedding GPU: %d\n", embedding_gpu);
+    fprintf(stderr, "  Output GPU: %d\n", output_gpu);
+    fprintf(stderr, "  Layers:\n    ");
+    for (int i = 0; i < layer_gpus.size(); i++) {
+      fprintf(stderr, "% 3d: %d ", i, layer_gpus[i]);
+      if ((i % 8) == 7 && i != layer_gpus.size() - 1) {
+        fprintf(stderr, "\n    ");
+      }
+    }
+    fprintf(stderr, "\n");
+  }
+  std::vector<int> used_gpus;
+  int embedding_gpu{-1};
+  std::vector<int> layer_gpus;
+  int output_gpu{-1};
+
+ private:
+  int consume(int& cur_gpu, size_t& cur_used, size_t reserved_size, size_t size) {
+    if (cur_gpu == -1) {
+      return -1;
+    }
+    int dev_count;
+    CHECK_CUDA(cudaGetDeviceCount(&dev_count));
+    do {
+      size_t avail, total;
+      scoped_gpu g(cur_gpu);
+      CHECK_CUDA(cudaMemGetInfo(&avail, &total));
+      if (avail - cur_used > size) {
+        cur_used += size;
+        return cur_gpu;
+      }
+      cur_gpu++;
+      cur_used = reserved_size;
+    } while (cur_gpu < dev_count);
+    return -1;
+  }
 };
 
 struct llama_model {
-  llama_model(llama_params params) : params(params) {
-    tok_embeddings = tensor4d<__half>(1, 1, params.n_vocab, params.dim);
-    output = tensor4d<__half>(1, 1, params.n_vocab, params.dim);
-    norm = tensor4d<__half>(1, 1, 1, params.dim);
-    ffn_dim = params.multiple_of * ceil_div(params.dim * 8 / 3, params.multiple_of);
+  llama_model(llama_params params, llama_partition partition)
+      : params(params), partition(partition) {
+    {
+      scoped_gpu g(partition.embedding_gpu);
+      tok_embeddings = tensor4d<__half>(1, 1, params.n_vocab, params.dim);
+    }
+    {
+      scoped_gpu g(partition.output_gpu);
+      output = tensor4d<__half>(1, 1, params.n_vocab, params.dim);
+      norm = tensor4d<__half>(1, 1, 1, params.dim);
+    }
     for (int i = 0; i < params.n_layers; ++i) {
+      scoped_gpu g(partition.layer_gpus[i]);
       layers.emplace_back();
       auto& layer = layers.back();
       layer.wk = tensor4d<__half>(1, 1, params.dim, params.dim);
@@ -769,16 +907,24 @@ struct llama_model {
       layer.wo = tensor4d<__half>(1, 1, params.dim, params.dim);
       layer.ffn_norm = tensor4d<__half>(1, 1, 1, params.dim);
       layer.attn_norm = tensor4d<__half>(1, 1, 1, params.dim);
-      layer.w1 = tensor4d<__half>(1, 1, ffn_dim, params.dim);
-      layer.w2 = tensor4d<__half>(1, 1, params.dim, ffn_dim);
-      layer.w3 = tensor4d<__half>(1, 1, ffn_dim, params.dim);
+      layer.w1 = tensor4d<__half>(1, 1, params.ffn_dim(), params.dim);
+      layer.w2 = tensor4d<__half>(1, 1, params.dim, params.ffn_dim());
+      layer.w3 = tensor4d<__half>(1, 1, params.ffn_dim(), params.dim);
     }
   }
   bool load(std::string const& path) {
-    RETURN_UNLESS(load_tensor(tok_embeddings, path, "tok_embeddings", params.n_vocab, params.dim));
-    RETURN_UNLESS(load_tensor(output, path, "output", params.n_vocab, params.dim));
-    RETURN_UNLESS(load_tensor(norm, path, "norm", params.dim));
+    {
+      scoped_gpu g(partition.embedding_gpu);
+      RETURN_UNLESS(
+          load_tensor(tok_embeddings, path, "tok_embeddings", params.n_vocab, params.dim));
+    }
+    {
+      scoped_gpu g(partition.output_gpu);
+      RETURN_UNLESS(load_tensor(output, path, "output", params.n_vocab, params.dim));
+      RETURN_UNLESS(load_tensor(norm, path, "norm", params.dim));
+    }
     for (int i = 0; i < params.n_layers; ++i) {
+      scoped_gpu g(partition.layer_gpus[i]);
       auto& layer = layers[i];
       std::string basename = "layers." + std::to_string(i) + ".";
       RETURN_UNLESS(load_tensor(layer.attn_norm, path, basename + "attention_norm", params.dim));
@@ -787,14 +933,17 @@ struct llama_model {
       RETURN_UNLESS(load_tensor(layer.wk, path, basename + "attention.wk", params.dim, params.dim));
       RETURN_UNLESS(load_tensor(layer.wv, path, basename + "attention.wv", params.dim, params.dim));
       RETURN_UNLESS(load_tensor(layer.wo, path, basename + "attention.wo", params.dim, params.dim));
-      RETURN_UNLESS(load_tensor(layer.w1, path, basename + "feed_forward.w1", ffn_dim, params.dim));
-      RETURN_UNLESS(load_tensor(layer.w2, path, basename + "feed_forward.w2", params.dim, ffn_dim));
-      RETURN_UNLESS(load_tensor(layer.w3, path, basename + "feed_forward.w3", ffn_dim, params.dim));
+      RETURN_UNLESS(
+          load_tensor(layer.w1, path, basename + "feed_forward.w1", params.ffn_dim(), params.dim));
+      RETURN_UNLESS(
+          load_tensor(layer.w2, path, basename + "feed_forward.w2", params.dim, params.ffn_dim()));
+      RETURN_UNLESS(
+          load_tensor(layer.w3, path, basename + "feed_forward.w3", params.ffn_dim(), params.dim));
     }
     return true;
   }
   llama_params params;
-  int ffn_dim;
+  llama_partition partition;
   tensor4d<__half> tok_embeddings;
   tensor4d<__half> norm;
   tensor4d<__half> output;
@@ -809,7 +958,7 @@ struct llama_model {
     mapped_buffer buf(path + "/" + name + ".weight__" + std::to_string(h) + "_" +
                       std::to_string(w));
     if (!buf.is_ok() || buf.size() != tensor.gpu.size()) {
-      fprintf(stderr, "failed to load tensor %s\n", name.c_str());
+      fprintf(stderr, "failed to load tensor %s (%zu x %zu)\n", name.c_str(), h, w);
       return false;
     }
     tensor.gpu.copy_from(buf);
@@ -832,90 +981,127 @@ struct llama_model {
 struct llama_context {
   llama_context(llama_model* model, int context_len = 2048, float temperature = 0.9)
       : model_(model), context_len_(context_len), temperature_(temperature) {
-    CHECK_CUDA(cudaEventCreate(&e_0_));
-    CHECK_CUDA(cudaEventCreate(&e_k_));
-    CHECK_CUDA(cudaEventCreate(&e_v_));
-    CHECK_CUDA(cudaStreamCreateWithFlags(&s_k_, cudaStreamNonBlocking));
-    CHECK_CUDA(cudaStreamCreateWithFlags(&s_v_, cudaStreamNonBlocking));
     reset();
   }
-  ~llama_context() {
-    CHECK_CUDA(cudaEventDestroy(e_0_));
-    CHECK_CUDA(cudaEventDestroy(e_k_));
-    CHECK_CUDA(cudaEventDestroy(e_v_));
-    CHECK_CUDA(cudaStreamDestroy(s_k_));
-    CHECK_CUDA(cudaStreamDestroy(s_v_));
-  }
   void reset() {
-    const int GUTTER = 128;
     kv_layers_.clear();
     for (int i = 0; i < model_->params.n_layers; ++i) {
+      scoped_gpu g(model_->partition.layer_gpus[i]);
       auto kv_layer = kv_cache_layer();
       kv_layer.k = tensor4d<__half>(1, 1, context_len_, model_->params.dim, GUTTER);
       kv_layer.v = tensor4d<__half>(1, 1, context_len_, model_->params.dim, GUTTER);
       kv_layers_.emplace_back(std::move(kv_layer));
     }
-    t_tokens_ = tensor4d<short>(1, 1, 1, context_len_);
-    t_embed_ = tensor4d<__half>(1, 1, context_len_, model_->params.dim, GUTTER);
-    t_norm_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
-    t_xq_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
-    t_xk_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
-    t_qk_ = tensor4d<__half>(1, model_->params.n_heads, t_embed_.h, t_embed_.h, GUTTER);
-    t_out_ = tensor4d<__half>(1, 1, t_embed_.h, t_embed_.w, GUTTER);
-    t_w1_ = tensor4d<__half>(1, 1, t_norm_.h, model_->ffn_dim, GUTTER);
-    t_w3_ = tensor4d<__half>(1, 1, t_norm_.h, model_->ffn_dim, GUTTER);
-    t_silu_ = tensor4d<__half>(1, 1, t_norm_.h, model_->ffn_dim, GUTTER);
-    t_logits_ = tensor4d<__half>(1, 1, 1, model_->params.n_vocab, GUTTER);
+    gpu_contexts_.clear();
+    for (auto gpu : model_->partition.used_gpus) {
+      scoped_gpu g(gpu);
+      auto gpu_context = per_gpu_context();
+      gpu_context.t_embed = tensor4d<__half>(1, 1, context_len_, model_->params.dim, GUTTER);
+      gpu_context.t_norm =
+          tensor4d<__half>(1, 1, gpu_context.t_embed.h, gpu_context.t_embed.w, GUTTER);
+      gpu_context.t_xq =
+          tensor4d<__half>(1, 1, gpu_context.t_embed.h, gpu_context.t_embed.w, GUTTER);
+      gpu_context.t_xk =
+          tensor4d<__half>(1, 1, gpu_context.t_embed.h, gpu_context.t_embed.w, GUTTER);
+      gpu_context.t_qk = tensor4d<__half>(1, model_->params.n_heads, gpu_context.t_embed.h,
+                                          gpu_context.t_embed.h, GUTTER);
+      gpu_context.t_out =
+          tensor4d<__half>(1, 1, gpu_context.t_embed.h, gpu_context.t_embed.w, GUTTER);
+      gpu_context.t_w1 =
+          tensor4d<__half>(1, 1, gpu_context.t_norm.h, model_->params.ffn_dim(), GUTTER);
+      gpu_context.t_w3 =
+          tensor4d<__half>(1, 1, gpu_context.t_norm.h, model_->params.ffn_dim(), GUTTER);
+      gpu_context.t_silu =
+          tensor4d<__half>(1, 1, gpu_context.t_norm.h, model_->params.ffn_dim(), GUTTER);
+      gpu_contexts_.emplace(gpu, std::move(gpu_context));
+      CHECK_CUDA(cudaFuncSetAttribute(kernel::matmul_nt_wmma_16x128x256,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, 78336));
+    }
+    {
+      scoped_gpu g(model_->partition.embedding_gpu);
+      t_tokens_ = tensor4d<short>(1, 1, 1, context_len_);
+    }
+    {
+      scoped_gpu g(model_->partition.output_gpu);
+      t_logits_ = tensor4d<__half>(1, 1, 1, model_->params.n_vocab, GUTTER);
+    }
     start_pos_ = 0;
   }
   size_t tokens_left() { return context_len_ - start_pos_; }
   size_t context_memory_usage() {
     size_t count = 0;
-
     for (auto& layer : kv_layers_) {
       count += layer.k.gpu.size();
       count += layer.v.gpu.size();
     }
-
+    for (auto& gpu_context : gpu_contexts_) {
+      auto& ctx = gpu_context.second;
+      count += ctx.t_embed.gpu.size();
+      count += ctx.t_norm.gpu.size();
+      count += ctx.t_xq.gpu.size();
+      count += ctx.t_xk.gpu.size();
+      count += ctx.t_qk.gpu.size();
+      count += ctx.t_out.gpu.size();
+      count += ctx.t_w1.gpu.size();
+      count += ctx.t_w3.gpu.size();
+      count += ctx.t_silu.gpu.size();
+    }
     count += t_tokens_.gpu.size();
-    count += t_embed_.gpu.size();
-    count += t_norm_.gpu.size();
-    count += t_xq_.gpu.size();
-    count += t_xk_.gpu.size();
-    count += t_qk_.gpu.size();
-    count += t_out_.gpu.size();
-    count += t_w1_.gpu.size();
-    count += t_w3_.gpu.size();
-    count += t_silu_.gpu.size();
     count += t_logits_.gpu.size();
     return count;
   }
   short next_token(std::vector<short> const& new_tokens) {
     assert(new_tokens.size() + start_pos_ <= context_len_);
+    assert(gpu_contexts_.size() > 0);
+    assert(model_->partition.embedding_gpu ==
+           gpu_contexts_.find(*model_->partition.layer_gpus.begin())->first);
+    assert(model_->partition.output_gpu ==
+           gpu_contexts_.find(*model_->partition.layer_gpus.rbegin())->first);
+    scoped_gpu embed_gpu(model_->partition.embedding_gpu);
+    auto& embed_ctx = gpu_contexts_.at(model_->partition.embedding_gpu);
+    auto& output_ctx = gpu_contexts_.at(model_->partition.output_gpu);
     auto v_tokens = t_tokens_.view().take(1, 1, 1, new_tokens.size());
-    auto v_embed = t_embed_.view().take(1, 1, new_tokens.size(), model_->params.dim);
-    auto v_norm = t_norm_.view().take(1, 1, v_embed.h, v_embed.w);
-    auto v_xq = t_xq_.view().take(1, 1, v_embed.h, v_embed.w);
-    auto v_xk = t_xk_.view().take(1, 1, new_tokens.size() + start_pos_, model_->params.dim);
-    // TODO: matmul_qk/qkv need to handle strided access to make this a view
-    auto tt_qk = tensor4d<__half>(1, model_->params.n_heads, new_tokens.size(),
-                                  new_tokens.size() + start_pos_);
-    auto v_qk = tt_qk.view();
-    auto v_out = t_out_.view().take(1, 1, v_embed.h, v_embed.w);
-    auto v_w1 = t_w1_.view().take(1, 1, v_norm.h, model_->ffn_dim);
-    auto v_w3 = t_w3_.view().take(1, 1, v_norm.h, model_->ffn_dim);
-    auto v_silu = t_silu_.view().take(1, 1, v_norm.h, model_->ffn_dim);
+    auto v_embed = embed_ctx.t_embed.view().take(1, 1, new_tokens.size(), model_->params.dim);
     auto v_logits = t_logits_.view().take(1, 1, 1, model_->params.n_vocab);
     v_tokens.gpu.copy_from(new_tokens.data(), new_tokens.size() * sizeof(short));
     kernel::embed<<<ceil_div(new_tokens.size(), 256), 256>>>(model_->params.dim, new_tokens.size(),
                                                              v_tokens.data(), v_embed.data(),
                                                              model_->tok_embeddings.data());
+    CHECK_CUDA(cudaGetLastError());
     for (int cur_layer = 0; cur_layer < model_->layers.size(); ++cur_layer) {
+      auto cur_layer_gpu_idx = model_->partition.layer_gpus[cur_layer];
+      auto prev_layer_gpu_idx =
+          cur_layer == 0 ? cur_layer_gpu_idx : model_->partition.layer_gpus[cur_layer - 1];
+      auto& layer_ctx = gpu_contexts_.at(cur_layer_gpu_idx);
+      auto& prev_layer_ctx = gpu_contexts_.at(prev_layer_gpu_idx);
+      auto v_layer_embed =
+          layer_ctx.t_embed.view().take(1, 1, new_tokens.size(), model_->params.dim);
+      auto v_prev_layer_embed =
+          prev_layer_ctx.t_embed.view().take(1, 1, new_tokens.size(), model_->params.dim);
+      scoped_gpu layer_gpu(cur_layer_gpu_idx);
+      if (cur_layer != 0 && prev_layer_gpu_idx != cur_layer_gpu_idx) {
+        CHECK_CUDA(cudaMemcpyPeer(v_layer_embed.gpu.data(), cur_layer_gpu_idx,
+                                  v_prev_layer_embed.gpu.data(), prev_layer_gpu_idx,
+                                  v_layer_embed.gpu.size()));
+      }
+      auto v_norm = layer_ctx.t_norm.view().take(v_embed.n, v_embed.c, v_embed.h, v_embed.w);
+      auto v_xq = layer_ctx.t_xq.view().take(v_embed.n, v_embed.c, v_embed.h, v_embed.w);
+      auto v_xk =
+          layer_ctx.t_xk.view().take(1, 1, new_tokens.size() + start_pos_, model_->params.dim);
+      // TODO: matmul_qk/qkv need to handle strided access to make this a view
+      auto tt_qk = tensor4d<__half>(1, model_->params.n_heads, new_tokens.size(),
+                                    new_tokens.size() + start_pos_);
+      auto v_qk = tt_qk.view();
+      auto v_out = layer_ctx.t_out.view().take(1, 1, v_embed.h, v_embed.w);
+      auto v_w1 = layer_ctx.t_w1.view().take(1, 1, v_norm.h, model_->params.ffn_dim());
+      auto v_w3 = layer_ctx.t_w3.view().take(1, 1, v_norm.h, model_->params.ffn_dim());
+      auto v_silu = layer_ctx.t_silu.view().take(1, 1, v_norm.h, model_->params.ffn_dim());
       dim3 gridDim;
       const dim3 blockDim(32, 32);
-      kernel::rms_norm<<<v_embed.h, 256>>>(v_norm.data(), v_embed.data(),
+      kernel::rms_norm<<<v_embed.h, 256>>>(v_norm.data(), v_layer_embed.data(),
                                            model_->layers[cur_layer].attn_norm.data(), v_embed.h,
                                            v_embed.w, model_->params.norm_eps);
+      CHECK_CUDA(cudaGetLastError());
       auto& kv_layer = kv_layers_[cur_layer];
       auto v_xk_full =
           kv_layer.k.view().take(1, 1, new_tokens.size() + start_pos_, model_->params.dim);
@@ -923,49 +1109,61 @@ struct llama_context {
           kv_layer.v.view().take(1, 1, new_tokens.size() + start_pos_, model_->params.dim);
       auto v_xk_new = v_xk_full.skip(0, 0, start_pos_, 0);
       auto v_xv_new = v_xv_full.skip(0, 0, start_pos_, 0);
-      CHECK_CUDA(cudaEventRecord(e_0_, 0));
-      CHECK_CUDA(cudaStreamWaitEvent(s_v_, e_0_));
-      CHECK_CUDA(cudaStreamWaitEvent(s_k_, e_0_));
+      CHECK_CUDA(cudaEventRecord(layer_ctx.e_0, 0));
+      CHECK_CUDA(cudaStreamWaitEvent(layer_ctx.s_v, layer_ctx.e_0));
+      CHECK_CUDA(cudaStreamWaitEvent(layer_ctx.s_k, layer_ctx.e_0));
       // Q
       matmul_nt(v_xq, v_norm, model_->layers[cur_layer].wq);
       gridDim = dim3(ceil_div(v_xq.w, 32), ceil_div(v_xq.h, 32));
       kernel::rotary<<<gridDim, blockDim>>>(v_xq.data(), v_xq.data(), v_xq.h, v_xq.w,
                                             model_->params.n_heads, start_pos_);
+      CHECK_CUDA(cudaGetLastError());
       // K
-      matmul_nt(v_xk_new, v_norm, model_->layers[cur_layer].wk, 0.0, s_k_);
+      matmul_nt(v_xk_new, v_norm, model_->layers[cur_layer].wk, 0.0, layer_ctx.s_k);
       gridDim = dim3(ceil_div(v_xk.w, 32), ceil_div(v_xk.h, 32));
-      kernel::rotary<<<gridDim, blockDim, 0, s_k_>>>(v_xk.data(), v_xk_full.data(), v_xk_full.h,
-                                                     v_xk_full.w, model_->params.n_heads);
+      kernel::rotary<<<gridDim, blockDim, 0, layer_ctx.s_k>>>(
+          v_xk.data(), v_xk_full.data(), v_xk_full.h, v_xk_full.w, model_->params.n_heads);
+      CHECK_CUDA(cudaGetLastError());
       // V
-      matmul_nt(v_xv_new, v_norm, model_->layers[cur_layer].wv, 0.0f, s_v_);
-      CHECK_CUDA(cudaEventRecord(e_k_, s_k_));
-      CHECK_CUDA(cudaStreamWaitEvent(0, e_k_));
-      CHECK_CUDA(cudaEventRecord(e_v_, s_v_));
-      CHECK_CUDA(cudaStreamWaitEvent(0, e_v_));
+      matmul_nt(v_xv_new, v_norm, model_->layers[cur_layer].wv, 0.0f, layer_ctx.s_v);
+      CHECK_CUDA(cudaEventRecord(layer_ctx.e_k, layer_ctx.s_k));
+      CHECK_CUDA(cudaStreamWaitEvent(0, layer_ctx.e_k));
+      CHECK_CUDA(cudaEventRecord(layer_ctx.e_v, layer_ctx.s_v));
+      CHECK_CUDA(cudaStreamWaitEvent(0, layer_ctx.e_v));
       gridDim = dim3(ceil_div(v_qk.w, 32), ceil_div(v_qk.h, 32), model_->params.n_heads);
       // softmax(QK^T / sqrt(head_dim)) * V
       kernel::matmul_qk<<<gridDim, blockDim>>>(v_qk.data(), v_xq.data(), v_xk.data(), v_xq.h,
                                                v_xk.h, v_xk.w, model_->params.n_heads, start_pos_);
+      CHECK_CUDA(cudaGetLastError());
       kernel::softmax_rows<<<dim3(v_qk.h, model_->params.n_heads), 256>>>(v_qk.data(), v_qk.data(),
                                                                           v_qk.h, v_qk.w);
+      CHECK_CUDA(cudaGetLastError());
       gridDim = dim3(ceil_div(v_xv_full.w, 32), ceil_div(v_xv_full.h, 32));
       kernel::matmul_qkv<<<gridDim, blockDim>>>(v_out.data(), v_qk.data(), v_xv_full.data(), v_qk.h,
                                                 v_xv_full.h, v_xv_full.w, model_->params.n_heads);
+      CHECK_CUDA(cudaGetLastError());
       // Residual
-      matmul_nt(v_embed, v_out, model_->layers[cur_layer].wo, 1.0f);
+      matmul_nt(v_layer_embed, v_out, model_->layers[cur_layer].wo, 1.0f);
       // FFN
-      kernel::rms_norm<<<v_embed.h, 256>>>(v_norm.data(), v_embed.data(),
+      kernel::rms_norm<<<v_embed.h, 256>>>(v_norm.data(), v_layer_embed.data(),
                                            model_->layers[cur_layer].ffn_norm.data(), v_embed.h,
                                            v_embed.w, model_->params.norm_eps);
+      CHECK_CUDA(cudaGetLastError());
       matmul_nt(v_w1, v_norm, model_->layers[cur_layer].w1);
       matmul_nt(v_w3, v_norm, model_->layers[cur_layer].w3);
       gridDim = dim3(ceil_div(v_silu.w * v_silu.h, 256));
       kernel::silu<<<gridDim, 256>>>(v_silu.data(), v_w1.data(), v_w3.data(), v_silu.h * v_silu.w);
-      matmul_nt(v_embed, v_silu, model_->layers[cur_layer].w2, 1.0f);
+      CHECK_CUDA(cudaGetLastError());
+      matmul_nt(v_layer_embed, v_silu, model_->layers[cur_layer].w2, 1.0f);
     }
-    kernel::rms_norm<<<v_embed.h, 256>>>(v_norm.data(), v_embed.data(), model_->norm.data(),
-                                         v_embed.h, v_embed.w, model_->params.norm_eps);
-    auto last_token_norm = v_norm.skip(0, 0, v_norm.h - 1, 0);
+    scoped_gpu output_gpu(model_->partition.output_gpu);
+    auto v_output_norm = output_ctx.t_norm.view().take(v_embed.n, v_embed.c, v_embed.h, v_embed.w);
+    auto v_output_embed =
+        output_ctx.t_embed.view().take(v_embed.n, v_embed.c, v_embed.h, v_embed.w);
+    kernel::rms_norm<<<v_embed.h, 256>>>(v_output_norm.data(), v_output_embed.data(),
+                                         model_->norm.data(), v_embed.h, v_embed.w,
+                                         model_->params.norm_eps);
+    auto last_token_norm = v_output_norm.skip(0, 0, v_output_norm.h - 1, 0);
     matmul_nt(v_logits, last_token_norm, model_->output);
     kernel::softmax_rows<<<v_logits.h, 256>>>(v_logits.data(), v_logits.data(), v_logits.h,
                                               v_logits.w, temperature_);
@@ -988,22 +1186,94 @@ struct llama_context {
     tensor4d<__half> k;
     tensor4d<__half> v;
   };
+  struct per_gpu_context {
+    per_gpu_context() {
+      CHECK_CUDA(cudaEventCreate(&e_0));
+      CHECK_CUDA(cudaEventCreate(&e_k));
+      CHECK_CUDA(cudaEventCreate(&e_v));
+      CHECK_CUDA(cudaStreamCreateWithFlags(&s_k, cudaStreamNonBlocking));
+      CHECK_CUDA(cudaStreamCreateWithFlags(&s_v, cudaStreamNonBlocking));
+    }
+    ~per_gpu_context() {
+      if (e_0) {
+        CHECK_CUDA(cudaEventDestroy(e_0));
+      }
+      if (e_k) {
+        CHECK_CUDA(cudaEventDestroy(e_k));
+      }
+      if (e_v) {
+        CHECK_CUDA(cudaEventDestroy(e_v));
+      }
+      if (s_k) {
+        CHECK_CUDA(cudaStreamDestroy(s_k));
+      }
+      if (s_v) {
+        CHECK_CUDA(cudaStreamDestroy(s_v));
+      }
+    }
+    per_gpu_context(per_gpu_context&& other) {
+      t_embed = std::move(other.t_embed);
+      t_norm = std::move(other.t_norm);
+      t_xq = std::move(other.t_xq);
+      t_xk = std::move(other.t_xk);
+      t_qk = std::move(other.t_qk);
+      t_out = std::move(other.t_out);
+      t_w1 = std::move(other.t_w1);
+      t_w3 = std::move(other.t_w3);
+      t_silu = std::move(other.t_silu);
+      e_0 = other.e_0;
+      e_k = other.e_k;
+      e_v = other.e_v;
+      s_k = other.s_k;
+      s_v = other.s_v;
+      other.e_0 = nullptr;
+      other.e_k = nullptr;
+      other.e_v = nullptr;
+      other.s_k = nullptr;
+      other.s_v = nullptr;
+    }
+    per_gpu_context& operator=(per_gpu_context&& other) {
+      t_embed = std::move(other.t_embed);
+      t_norm = std::move(other.t_norm);
+      t_xq = std::move(other.t_xq);
+      t_xk = std::move(other.t_xk);
+      t_qk = std::move(other.t_qk);
+      t_out = std::move(other.t_out);
+      t_w1 = std::move(other.t_w1);
+      t_w3 = std::move(other.t_w3);
+      t_silu = std::move(other.t_silu);
+      e_0 = other.e_0;
+      e_k = other.e_k;
+      e_v = other.e_v;
+      s_k = other.s_k;
+      s_v = other.s_v;
+      other.e_0 = nullptr;
+      other.e_k = nullptr;
+      other.e_v = nullptr;
+      other.s_k = nullptr;
+      other.s_v = nullptr;
+      return *this;
+    }
+    per_gpu_context(const per_gpu_context&) = delete;
+    per_gpu_context& operator=(const per_gpu_context&) = delete;
+    tensor4d<__half> t_embed;
+    tensor4d<__half> t_norm;
+    tensor4d<__half> t_xq;
+    tensor4d<__half> t_xk;
+    tensor4d<__half> t_qk;
+    tensor4d<__half> t_out;
+    tensor4d<__half> t_w1;
+    tensor4d<__half> t_w3;
+    tensor4d<__half> t_silu;
+    cudaEvent_t e_0{}, e_k{}, e_v{};
+    cudaStream_t s_k{}, s_v{};
+  };
   llama_model* model_;
   std::vector<kv_cache_layer> kv_layers_;
+  std::unordered_map<int, per_gpu_context> gpu_contexts_;
   int context_len_;
   int start_pos_{0};
-  cudaEvent_t e_0_, e_k_, e_v_;
-  cudaStream_t s_k_, s_v_;
   tensor4d<short> t_tokens_;
-  tensor4d<__half> t_embed_;
-  tensor4d<__half> t_norm_;
-  tensor4d<__half> t_xq_;
-  tensor4d<__half> t_xk_;
-  tensor4d<__half> t_qk_;
-  tensor4d<__half> t_out_;
-  tensor4d<__half> t_w1_;
-  tensor4d<__half> t_w3_;
-  tensor4d<__half> t_silu_;
   tensor4d<__half> t_logits_;
   std::random_device rng_;
   float temperature_;
@@ -1238,11 +1508,13 @@ void matmul_nt(tensor4d_view<__half> out,
     default:
       assert(false && "invalid matmul type");
   }
+  CHECK_CUDA(cudaGetLastError());
 }
 
 int main(int argc, char const** argv) {
   int device;
   cudaDeviceProp prop;
+  size_t context_len = 2048;
   std::string model_name = "filthy_instruct_v6";
   std::string prompt_str = "Building a website can be done in 10 easy steps:";
   if (argc > 1) {
@@ -1263,12 +1535,6 @@ int main(int argc, char const** argv) {
   printf("Shared mem size per block (optin): %zu bytes\n", prop.sharedMemPerBlockOptin);
   printf("Shared mem size per block (reserved): %zu bytes\n", prop.reservedSharedMemPerBlock);
   printf("L2 cache size: %d bytes\n", prop.l2CacheSize);
-  CHECK_CUDA(cudaFuncSetAttribute(kernel::matmul_nt_wmma_128x64x64,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  prop.sharedMemPerBlockOptin));
-  CHECK_CUDA(cudaFuncSetAttribute(kernel::matmul_nt_wmma_16x128x256,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  prop.sharedMemPerBlockOptin));
   mapped_buffer params_buf("models/" + model_name + "/params");
   mapped_buffer vocab_buf("models/" + model_name + "/vocab");
   if (!params_buf.is_ok()) {
@@ -1285,27 +1551,35 @@ int main(int argc, char const** argv) {
     fprintf(stderr, "Vocab size mismatch\n");
     return 1;
   }
-  llama_model model(params);
-  if (!model.load("models/" + model_name)) {
-    fprintf(stderr, "Could not load model\n");
+  llama_partition partition;
+  partition.autopipe(params, context_len);
+  partition.debug_print();
+  if (!partition.is_valid()) {
+    fprintf(stderr, "Could not partition model\n");
     return 1;
   }
   printf(
       "Dimension: %d\nSwiGLU multiple: %d\nLayers: %d\nHeads: %d\nVocab: "
-      "%d\nNorm Epsilon: %f\n",
+      "%d\nNorm Epsilon: %f\nShared Context Memory: %f MB\nPer-Layer Context Memory: %f MB\n",
       params.dim, params.multiple_of, params.n_layers, params.n_heads, params.n_vocab,
-      params.norm_eps);
+      params.norm_eps, params.shared_context_memory_size(context_len) / 1024.0 / 1024.0,
+      params.kv_cache_size(context_len) / 1024.0 / 1024.0);
+  llama_model model(params, partition);
+  if (!model.load("models/" + model_name)) {
+    fprintf(stderr, "Could not load model\n");
+    return 1;
+  }
 #ifdef ENABLE_CUBLAS
   cublasCreate(&cublas_handle);
   cublasSetMathMode(cublas_handle, cublasMath_t(CUBLAS_DEFAULT_MATH |
                                                 CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));
 #endif
-  llama_context context(&model, 2048, 0.8);
+  llama_context context(&model, context_len, 0.8);
   printf("Context memory: %f MB\n", context.context_memory_usage() / 1024.0 / 1024.0);
 #ifdef BENCH
   std::vector<short> tokens;
 
-  for (int i = 0; i < 2048; ++i) {
+  for (int i = 0; i < context_len; ++i) {
     tokens.push_back(1);
   }
 
@@ -1328,7 +1602,7 @@ int main(int argc, char const** argv) {
     if (context.tokens_left() == 0) {
       context.reset();
       tokens.clear();
-      tokens.insert(tokens.end(), complete_tokens.end() - 1024, complete_tokens.end());
+      tokens.insert(tokens.end(), complete_tokens.end() - context_len / 2, complete_tokens.end());
     }
     auto next_token = context.next_token(tokens);
     token_end = monoclock::now();
