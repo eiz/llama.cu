@@ -20,12 +20,15 @@ Windows:
 
 On either platform, you can speed things up by setting the `ENABLE_CUBLAS` CMake option.
 
+Recent additions:
+
+* Added pipeline parallel multi-GPU support. Can now load 30B in fp16 on my 4090/6000 box.
+
 There's some big TODOs right now:
 
 * make an actual CLI lol
 * matmul_qk / matmul_qkv need tiled implementations (they are very slow) & cuBLAS equivalents with explicit transposes
 * add quantization support (big refactor)
-* multi-GPU for fp16 big models
 * matmuls should use pipelining to load from global memory
 * clean up extract.py / add support for common model file formats
 * implement/test 13/30/65 models
