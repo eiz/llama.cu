@@ -31,7 +31,7 @@ There's some big TODOs right now:
 * add quantization support (big refactor)
 * matmuls should use pipelining to load from global memory
 * clean up extract.py / add support for common model file formats
-* implement/test 13/30/65 models
+* test 65 model on a sufficiently large computer
 * implement a more proper sampler
 * create a proper library interface and tools
 * it currently targets the RTX 4090. You can easily run it on Ampere devices by changing the architecture target, but anything less than 24GB or older than that will fail (either OOM or shared mem size limits). Probably will not bother fixing this until quantization is done.
