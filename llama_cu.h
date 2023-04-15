@@ -1,7 +1,7 @@
 #pragma once
 
 // clangd just isn't smart enough to figure this one out when editing llama_cu.h
-#define LLAMA_CU_IMPLEMENTATION
+// #define LLAMA_CU_IMPLEMENTATION
 
 // more clangd hacks see https://github.com/NVIDIA/thrust/issues/1703 some wacky stuff happens
 #if defined(__noinline__) && defined(_CLANGD)
