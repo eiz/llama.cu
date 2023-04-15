@@ -7,6 +7,7 @@ option(ENABLE_CUBLAS "Enable cuBLAS library support" OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_ARCHITECTURES "89")
 
 if(MSVC)
     set(CMAKE_CUDA_FLAGS_RELEASE "-O2")
@@ -18,13 +19,15 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-add_executable(llama_cu main.cu)
-
-set_target_properties(llama_cu PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_ARCHITECTURES "89"
+add_library(llama_cu_lib STATIC
+    llama_cu.cu
+    llama_cu.h
 )
 
+set_target_properties(llama_cu_lib PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(llama_cu main.cu)
+target_link_libraries(llama_cu llama_cu_lib)
 target_include_directories(llama_cu PRIVATE ${CUDA_INCLUDE_DIRS})
 
 if(ENABLE_CUBLAS)

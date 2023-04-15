@@ -1,4 +1,6 @@
 CompileFlags:
+  Add:
+    - -D_CLANGD=1
   Remove:
     - -forward-unknown-to-host-compiler
     - --generate-code*
