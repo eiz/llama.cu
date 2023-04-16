@@ -19,24 +19,20 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-add_library(llama_cu_lib STATIC
-    llama_cu.cu
-    llama_cu.h
-)
-
+add_library(llama_cu_lib STATIC llama_cu.cu llama_cu.h)
 set_target_properties(llama_cu_lib PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
-add_executable(llama_cu main.cu)
-target_link_libraries(llama_cu llama_cu_lib)
-target_include_directories(llama_cu PRIVATE ${CUDA_INCLUDE_DIRS})
+target_include_directories(llama_cu_lib PRIVATE ${CUDA_INCLUDE_DIRS})
 
 if(ENABLE_CUBLAS)
     if (UNIX AND NOT APPLE)
         message(STATUS "Linking to static cuBLAS library on Linux")
-        target_link_libraries(llama_cu ${CUDA_LIBRARIES} CUDA::cublas_static CUDA::cublasLt_static)
+        target_link_libraries(llama_cu_lib ${CUDA_LIBRARIES} CUDA::cublas_static CUDA::cublasLt_static)
     elseif (WIN32)
         message(STATUS "Linking to dynamic cuBLAS library on Windows")
-        target_link_libraries(llama_cu ${CUDA_LIBRARIES} CUDA::cublas CUDA::cublasLt)
+        target_link_libraries(llama_cu_lib ${CUDA_LIBRARIES} CUDA::cublas CUDA::cublasLt)
     endif()
-    target_compile_definitions(llama_cu PRIVATE ENABLE_CUBLAS)
+    target_compile_definitions(llama_cu_lib PRIVATE ENABLE_CUBLAS)
 endif()
+
+add_executable(llama_cu main.cpp)
+target_link_libraries(llama_cu llama_cu_lib)

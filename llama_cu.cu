@@ -1404,6 +1404,17 @@ void matmul_nt(tensor4d_view<__half> out,
 }
 
 void initialize() {
+  int device;
+  cudaDeviceProp prop;
+  CHECK_CUDA(cudaGetDevice(&device));
+  CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+  printf("Device name: %s\n", prop.name);
+  printf("Number of SMs: %d\n", prop.multiProcessorCount);
+  printf("Shared mem size per SM: %zu bytes\n", prop.sharedMemPerMultiprocessor);
+  printf("Shared mem size per block: %zu bytes\n", prop.sharedMemPerBlock);
+  printf("Shared mem size per block (optin): %zu bytes\n", prop.sharedMemPerBlockOptin);
+  printf("Shared mem size per block (reserved): %zu bytes\n", prop.reservedSharedMemPerBlock);
+  printf("L2 cache size: %d bytes\n", prop.l2CacheSize);
 #ifdef ENABLE_CUBLAS
   cublasCreate(&cublas_handle);
   cublasSetMathMode(cublas_handle, cublasMath_t(CUBLAS_DEFAULT_MATH |

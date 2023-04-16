@@ -5,8 +5,6 @@
 #include "llama_cu.h"
 
 int main(int argc, char const** argv) {
-  int device;
-  cudaDeviceProp prop;
   size_t context_len = 2048;
   std::string model_name = "filthy_instruct_v6";
   std::string prompt_str = "Building a website can be done in 10 easy steps:";
@@ -19,15 +17,8 @@ int main(int argc, char const** argv) {
   if (argc > 3) {
     prompt_str = argv[3];
   }
-  CHECK_CUDA(cudaGetDevice(&device));
-  CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
-  printf("Device name: %s\n", prop.name);
-  printf("Number of SMs: %d\n", prop.multiProcessorCount);
-  printf("Shared mem size per SM: %zu bytes\n", prop.sharedMemPerMultiprocessor);
-  printf("Shared mem size per block: %zu bytes\n", prop.sharedMemPerBlock);
-  printf("Shared mem size per block (optin): %zu bytes\n", prop.sharedMemPerBlockOptin);
-  printf("Shared mem size per block (reserved): %zu bytes\n", prop.reservedSharedMemPerBlock);
-  printf("L2 cache size: %d bytes\n", prop.l2CacheSize);
+  int device;
+
   llama_cu::initialize();
   llama_cu::mapped_buffer params_buf("models/" + model_name + "/params");
   llama_cu::mapped_buffer vocab_buf("models/" + model_name + "/vocab");

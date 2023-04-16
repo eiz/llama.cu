@@ -128,16 +128,16 @@ enum class llama_quantization_type : uint8_t {
 };
 
 struct llama_params {
-  // uint32_t magic;
-  // uint32_t model_fourcc;
-  // uint32_t struct_size;
+  uint64_t magic;
+  uint32_t model_fourcc;
+  uint32_t struct_size;
   uint32_t dim;
   uint32_t multiple_of;
   uint32_t n_heads;
   uint32_t n_layers;
   uint32_t n_vocab;
   float norm_eps;
-  // llama_quantization_type quantization_type;
+  llama_quantization_type quantization_type;
   // uint8_t reserved0[3];
   uint32_t ffn_dim() const;
   size_t layer_size() const;
