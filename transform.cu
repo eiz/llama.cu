@@ -74,7 +74,7 @@ __device__ __forceinline__ float atomic_max_float(float* addr, float value) {
   return old;
 }
 
-// output[0] = rms error, output[1] = max error, output[2] = mean absolute error
+// output[0] = mean squared error, output[1] = max error, output[2] = mean absolute error
 __global__ void error_stats(float* output,
                             half const* __restrict__ lhs,
                             half const* __restrict__ rhs,
@@ -153,8 +153,7 @@ bool quantize_one(std::string const& input_model,
   error_stats<<<128, 1024>>>(error.data(), input.data(), output_dequantized.data(), h * w);
   float host_error[3];
   error.gpu.copy_to(&host_error, sizeof(float) * 3);
-  printf("  rms error: %f, max error: %f, mean abs error: %f\n", sqrt(host_error[0]), host_error[1],
-         host_error[2]);
+  printf("  rms/max/mean error: %f/%f/%f\n", sqrt(host_error[0]), host_error[1], host_error[2]);
   mapped_buffer out_buf("models/" + output_model + "/" + name + ".weight__" + std::to_string(h) +
                             "_" + std::to_string(w),
                         output.gpu.size());
