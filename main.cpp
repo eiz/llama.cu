@@ -1,8 +1,10 @@
 #include <cassert>
+#include <chrono>
 #include <string>
 
-#define LLAMA_CU_IMPLEMENTATION
 #include "llama_cu.h"
+
+using monoclock = std::chrono::steady_clock;
 
 int main(int argc, char const** argv) {
   size_t context_len = 2048;
@@ -18,7 +20,6 @@ int main(int argc, char const** argv) {
     prompt_str = argv[3];
   }
   int device;
-
   llama_cu::initialize();
   llama_cu::mapped_buffer params_buf("models/" + model_name + "/params");
   llama_cu::mapped_buffer vocab_buf("models/" + model_name + "/vocab");
@@ -54,7 +55,6 @@ int main(int argc, char const** argv) {
     fprintf(stderr, "Could not load model\n");
     return 1;
   }
-
   auto context = llama_cu::llama_context::create(&*model, context_len, 0.8);
   printf("Context memory: %f MB\n", context->context_memory_usage() / 1024.0 / 1024.0);
 #ifdef BENCH
@@ -72,21 +72,21 @@ int main(int argc, char const** argv) {
 #else
   std::vector<short> tokens = vocab.tokenize(prompt_str, true);
   auto prompt_tokens = tokens.size();
-  llama_cu::monoclock::time_point start, end;
+  monoclock::time_point start, end;
   int tokens_generated = 0;
   std::vector<float> token_times;
   std::vector<short> complete_tokens = tokens;
-  start = llama_cu::monoclock::now();
+  start = monoclock::now();
   while (true) {
-    llama_cu::monoclock::time_point token_start, token_end;
-    token_start = llama_cu::monoclock::now();
+    monoclock::time_point token_start, token_end;
+    token_start = monoclock::now();
     if (context->tokens_left() == 0) {
       context->clear_tokens();
       tokens.clear();
       tokens.insert(tokens.end(), complete_tokens.end() - context_len / 2, complete_tokens.end());
     }
     auto next_token = context->next_token(tokens);
-    token_end = llama_cu::monoclock::now();
+    token_end = monoclock::now();
     if (next_token == 2) {
       break;
     }
@@ -98,7 +98,7 @@ int main(int argc, char const** argv) {
     token_times.push_back((token_end - token_start).count() / 1e9);
     tokens_generated++;
   }
-  end = llama_cu::monoclock::now();
+  end = monoclock::now();
   printf("\ntokens: %d time: %f\n", tokens_generated, (end - start).count() / 1e9);
   FILE* fp = fopen("times.txt", "w");
   assert(fp);

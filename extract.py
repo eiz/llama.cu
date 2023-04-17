@@ -28,10 +28,9 @@ def extract_params(input_file, output_file):
         config = json.load(f_in)
         f_out.write(
             struct.pack(
-                "QIIiiiiifi",
+                "<QIiiiiifi",
                 0x000041524F525541,  # "AURORA\0\0"
                 0x414D4C4C,  # "LLMA"
-                44,  # header size
                 config["dim"],
                 config["multiple_of"],
                 config["n_heads"],

@@ -9,17 +9,12 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <queue>
 #include <random>
-#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include <fcntl.h>
-
-#define CUDA_API_PER_THREAD_DEFAULT_STREAM
 #ifdef ENABLE_CUBLAS
 #include <cublas_v2.h>
 #endif
@@ -65,7 +60,6 @@ __global__ void rms_norm(__half* output, __half* input, __half* weights, int h, 
   bool warp_leader = (tid % 32) == 0;
   __shared__ float s_rms_inv;
   __shared__ float s_warp_reduced[8];
-  __syncthreads();
   float sum_val = 0.0f;
   // sum_sq: thread reduction
   for (int i = tid; i < w; i += blockDim.x) {
@@ -462,6 +456,39 @@ mapped_buffer::mapped_buffer(std::string const& path) {
   }
 #endif
 }
+mapped_buffer::mapped_buffer(std::string const& path, size_t size) {
+#if defined(_WIN32)
+  fd_ = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (fd_ == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  size_ = size;
+  mapping_ = CreateFileMapping(fd_, nullptr, PAGE_READWRITE, 0, size, nullptr);
+  if (mapping_ == nullptr) {
+    CloseHandle(fd_);
+    fd_ = INVALID_HANDLE_VALUE;
+    return;
+  }
+  ptr_ = MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+#else
+  int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    return;
+  }
+  fd_ = fd;
+  size_ = size;
+  if (ftruncate(fd_, size_) < 0) {
+    close(fd_);
+    fd_ = -1;
+    return;
+  }
+  ptr_ = mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+  if (ptr_ == MAP_FAILED) {
+    ptr_ = nullptr;
+  }
+#endif
+}
 mapped_buffer::mapped_buffer(size_t size) {
 #if defined(_WIN32)
   mapping_ = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, size, nullptr);
@@ -588,107 +615,6 @@ gpu_buffer::~gpu_buffer() {
   }
 }
 
-template <typename T>
-float to_float(T other_float);
-template <>
-float to_float(float other_float) {
-  return other_float;
-}
-template <>
-float to_float(__half other_float) {
-  return __half2float(other_float);
-}
-
-template <typename T>
-struct tensor4d;
-
-template <typename T>
-struct tensor4d_view {
-  tensor4d_view() : n(0), c(0), h(0), w(0), stride_n(0), stride_c(0), stride_h(0) {}
-  tensor4d_view(size_t n,
-                size_t c,
-                size_t h,
-                size_t w,
-                size_t stride_n,
-                size_t stride_c,
-                size_t stride_h,
-                gpu_buffer_view gpu)
-      : n(n),
-        c(c),
-        h(h),
-        w(w),
-        stride_n(stride_n),
-        stride_c(stride_c),
-        stride_h(stride_h),
-        gpu(gpu) {}
-  size_t size() { return n * c * h * w; }
-  T* data() { return reinterpret_cast<T*>(gpu.data()); }
-  tensor4d_view<T> skip(int skip_n, int skip_c, int skip_h, int skip_w) {
-    tensor4d_view<T> result = *this;
-    result.n -= skip_n;
-    result.c -= skip_c;
-    result.h -= skip_h;
-    result.w -= skip_w;
-    auto skip_el = skip_n * stride_n + skip_c * stride_c + skip_h * stride_h + skip_w;
-    result.gpu = gpu_buffer_view(reinterpret_cast<char*>(result.gpu.data()) + skip_el * sizeof(T),
-                                 gpu.size() - skip_el * sizeof(T));
-    return result;
-  }
-  tensor4d_view<T> take(int take_n, int take_c, int take_h, int take_w) {
-    tensor4d_view<T> result = *this;
-    result.n = take_n;
-    result.c = take_c;
-    result.h = take_h;
-    result.w = take_w;
-    auto take_el = take_n * stride_n;
-    result.gpu = gpu_buffer_view(result.gpu.data(), take_el * sizeof(T));
-    return result;
-  }
-  void debug_print(char const* title, float divisor = 1.0) {
-    T* cpu = (T*)malloc(gpu.size());
-    gpu.copy_to(cpu, gpu.size());
-    printf("==%s (%zu,%zu,%zu,%zu) (%zu,%zu,%zu)==\n", title, n, c, h, w, stride_n, stride_c,
-           stride_h);
-    for (int cur_c = 0; cur_c < c; ++cur_c) {
-      printf("channel %d\n", cur_c);
-      for (int cur_h = 0; cur_h < h; ++cur_h) {
-        printf("% 4d ", cur_h);
-        for (int cur_w = 0; cur_w < w; ++cur_w) {
-          printf("% 9.6f, ", to_float(cpu[cur_c * stride_c + cur_h * stride_h + cur_w]) / divisor);
-          if (cur_w > 1 && cur_w < w - 4 && w > 3) {
-            printf(" ... ");
-            cur_w = std::max<int>(cur_w, w - 4);
-          }
-        }
-        printf("\n");
-      }
-      printf("\n\n\n");
-    }
-    free(cpu);
-  }
-  size_t n, c, h, w;
-  size_t stride_n, stride_c, stride_h;
-  gpu_buffer_view gpu;
-};
-
-template <typename T>
-struct tensor4d {
-  tensor4d() : n(0), c(0), h(0), w(0) {}
-  // TODO(eiz): stupid gutter hack for 128x64 wmma kernel
-  tensor4d(size_t n, size_t c, size_t h, size_t w, size_t gutter_h = 0)
-      : n(n), c(c), h(h), w(w), gpu(gpu_buffer(n * c * (h + gutter_h) * w * sizeof(T))) {
-    if (gutter_h > 0) {
-      cudaMemset(gpu.data(), 0, gpu.size());
-    }
-  }
-  size_t size() const { return n * c * h * w; }
-  operator tensor4d_view<T>() { return tensor4d_view<T>(n, c, h, w, c * h * w, h * w, w, gpu); }
-  tensor4d_view<T> view() { return *this; }
-  T* data() { return reinterpret_cast<T*>(gpu.data()); }
-  size_t n, c, h, w;
-  gpu_buffer gpu;
-};
-
 void matmul_nt(tensor4d_view<__half> out,
                tensor4d_view<__half> lhs,
                tensor4d_view<__half> rhs,
@@ -703,6 +629,20 @@ struct llama_layer {
 
 constexpr int GUTTER = 128;
 
+bool llama_params::load(mapped_buffer const& buffer) {
+  if (buffer.size() != sizeof(llama_params)) {
+    return false;
+  }
+  auto params = reinterpret_cast<llama_params const*>(buffer.data());
+  if (params->magic != LLAMA_CU_MAGIC) {
+    return false;
+  }
+  if (params->fourcc != LLAMA_CU_MODEL_FOURCC_LLAMA) {
+    return false;
+  }
+  *this = *params;
+  return true;
+}
 uint32_t llama_params::ffn_dim() const {
   return round_up(dim * 8 / 3, multiple_of);
 }
