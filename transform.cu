@@ -5,12 +5,12 @@
 
 namespace llama_cu {
 // atm there's no reason to do this on the gpu, but i want it for later
-__global__ void quantize_absmax(uint8_t* output,
-                                half* scales,
-                                half const* __restrict__ input,
-                                int M,
-                                int N,
-                                int K) {
+__global__ void quantize_absmax_uint8(uint8_t* output,
+                                      half* scales,
+                                      half const* __restrict__ input,
+                                      int M,
+                                      int N,
+                                      int K) {
   __shared__ float s_warp_reduced[32];
   __shared__ half s_absmax;
   float absmax_val = 0;
@@ -51,12 +51,12 @@ __global__ void quantize_absmax(uint8_t* output,
   }
 }
 
-__global__ void dequantize_absmax(half* output,
-                                  half const* __restrict__ scales,
-                                  uint8_t const* __restrict__ input,
-                                  int M,
-                                  int N,
-                                  int K) {
+__global__ void dequantize_absmax_uint8(half* output,
+                                        half const* __restrict__ scales,
+                                        uint8_t const* __restrict__ input,
+                                        int M,
+                                        int N,
+                                        int K) {
   int row = blockIdx.y;
   int tid = threadIdx.x;
   int block_count = N / K;
@@ -146,10 +146,14 @@ bool quantize_one(std::string const& input_model,
     return false;
   }
   input.gpu.copy_from(buf);
-  quantize_absmax<<<dim3(w / block_size, h), std::min(block_size, 1024)>>>(
+  quantize_absmax_uint8<<<dim3(w / block_size, h), std::min(block_size, 1024)>>>(
       output.data(), scales.data(), input.data(), h, w, block_size);
-  dequantize_absmax<<<dim3(w / block_size, h), std::min(block_size, 1024)>>>(
+  dequantize_absmax_uint8<<<dim3(w / block_size, h), std::min(block_size, 1024)>>>(
       output_dequantized.data(), scales.data(), output.data(), h, w, block_size);
+  if (name == "tok_embeddings") {
+    input.view().debug_print("tok_embeddings");
+    output_dequantized.view().debug_print("tok_embeddings_dequantized");
+  }
   error_stats<<<128, 1024>>>(error.data(), input.data(), output_dequantized.data(), h * w);
   float host_error[3];
   error.gpu.copy_to(&host_error, sizeof(float) * 3);
@@ -158,7 +162,7 @@ bool quantize_one(std::string const& input_model,
                             "_" + std::to_string(w),
                         output.gpu.size());
   mapped_buffer scale_buf("models/" + output_model + "/" + name + ".scale__" + std::to_string(h) +
-                              "_" + std::to_string(w),
+                              "_" + std::to_string(w / block_size),
                           scales.gpu.size());
   if (!out_buf.is_ok()) {
     fprintf(stderr, "failed to create weight tensor %s (%zu x %zu)\n", name.c_str(), h, w);
@@ -199,7 +203,7 @@ bool do_quantize(const std::string& input_model,
                  const std::string& output_model,
                  const llama_params& in_params,
                  int block_size) {
-  if (in_params.quantization_type != llama_quantization_type::fp16) {
+  if (in_params.q_type != quantization_type::fp16) {
     fprintf(stderr, "Input model is not fp16\n");
     return false;
   }
@@ -229,7 +233,7 @@ bool do_quantize(const std::string& input_model,
                                in_params.ffn_dim(), in_params.dim, block_size));
   }
   llama_params out_params = in_params;
-  out_params.quantization_type = llama_quantization_type::uint8;
+  out_params.q_type = quantization_type::uint8;
   out_params.quantization_block_size = block_size;
   mapped_buffer params_buf("models/" + output_model + "/params", sizeof(llama_params));
   if (!params_buf.is_ok()) {
@@ -270,7 +274,7 @@ bool load_tensor_by_address(tensor4d<T>& output,
     return false;
   }
   if (part_name == "scale") {
-    if (params.quantization_type == llama_quantization_type::fp16) {
+    if (params.q_type == quantization_type::fp16) {
       fprintf(stderr, "Cannot load scale for fp16 model\n");
       return false;
     }
@@ -293,7 +297,7 @@ bool do_histogram(const std::string& input_model,
                   const llama_params& params,
                   const std::string& tensor_name,
                   int layer_index) {
-  if (params.quantization_type != llama_quantization_type::uint8) {
+  if (params.q_type != quantization_type::uint8) {
     fprintf(stderr, "Input model is not uint8\n");
     return false;
   }

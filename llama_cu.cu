@@ -36,6 +36,7 @@ __device__ __host__ __forceinline__ size_t round_up(size_t a, size_t b) {
 }
 
 namespace kernel {
+// TODO: these embed kernels are objectively terrible
 __global__ void embed(int n_dim,
                       int n_ids,
                       short* in_ids,
@@ -46,6 +47,24 @@ __global__ void embed(int n_dim,
     int id = in_ids[tid];
     for (int i = 0; i < n_dim; i++) {
       out_embeddings[tid * n_dim + i] = embeddings_table[id * n_dim + i];
+    }
+  }
+}
+
+__global__ void embed_uint8(int n_dim,
+                            int n_ids,
+                            short* in_ids,
+                            __half* out_embeddings,
+                            uint8_t* embeddings_table,
+                            half* scales,
+                            int block_size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int block_count = n_dim / block_size;
+  if (tid < n_ids) {
+    int id = in_ids[tid];
+    for (int i = 0; i < n_dim; i++) {
+      out_embeddings[tid * n_dim + i] = (float(embeddings_table[id * n_dim + i]) - 127.5f) *
+                                        __half2float(scales[id * block_count + i / block_size]);
     }
   }
 }
@@ -110,10 +129,33 @@ matmul_nt(__half* output, __half* lhs, __half* rhs, int m, int p, int n, float b
   }
 }
 
+// the simplest quantized right side kernel. reference.
+__global__ void matmul_nt_fp16u8(half* __restrict__ output,
+                                 half const* __restrict__ lhs,
+                                 uint8_t const* __restrict__ rhs,
+                                 half const* __restrict__ scales,
+                                 int m,
+                                 int p,
+                                 int n,
+                                 int block_size,
+                                 float beta = 0.0f) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  int r = blockIdx.y * blockDim.y + threadIdx.y;
+  int block_count = p / block_size;
+  if (r < m && c < n) {
+    float sum = 0;
+    for (int i = 0; i < p; i++) {
+      sum += __half2float(lhs[r * p + i]) * (float(rhs[c * p + i]) - 127.5) *
+             __half2float(scales[c * block_count + i / block_size]);
+    }
+    output[r * n + c] = sum + beta * __half2float(output[r * n + c]);
+  }
+}
+
 // output = lhs * rhs^T; lhs = (m, p); rhs = (n, p); output = (m, n)
 // blockDim must be (256, 1, 1). gridDim must be (m/128 * n/64, 1, 1)
 // m must be a multiple of 128, n and p must be multiples of 64
-__global__ void matmul_nt_wmma_128x64x64(__half* output,
+__global__ void matmul_nt_wmma_128x64x64(__half* __restrict__ output,
                                          __half const* __restrict__ lhs,
                                          __half const* __restrict__ rhs,
                                          int m,
@@ -188,7 +230,7 @@ __global__ void matmul_nt_wmma_128x64x64(__half* output,
 // output = lhs * rhs^T; lhs = (m, p); rhs = (n, p); output = (m, n)
 // blockDim must be (256, 1, 1). gridDim must be (m/16 * n/128, 1, 1)
 // m must be a multiple of 16, n must be a multiple of 128 and p a multiple of 256
-__global__ void matmul_nt_wmma_16x128x256(__half* output,
+__global__ void matmul_nt_wmma_16x128x256(__half* __restrict__ output,
                                           __half const* __restrict__ lhs,
                                           __half const* __restrict__ rhs,
                                           int m,
@@ -620,12 +662,11 @@ void matmul_nt(tensor4d_view<__half> out,
                tensor4d_view<__half> rhs,
                __half beta = 0.0f,
                cudaStream_t stream = 0);
-
-struct llama_layer {
-  tensor4d<__half> wk, wq, wv, wo;
-  tensor4d<__half> w1, w2, w3;
-  tensor4d<__half> ffn_norm, attn_norm;
-};
+void matmul_nt(tensor4d_view<__half> out,
+               tensor4d_view<__half> lhs,
+               generic_tensor& rhs,
+               __half beta = 0.0f,
+               cudaStream_t stream = 0);
 
 constexpr int GUTTER = 128;
 
@@ -750,33 +791,15 @@ int llama_partition::consume(int& cur_gpu, size_t& cur_used, size_t reserved_siz
   return -1;
 }
 
+struct llama_layer {
+  generic_tensor wk, wq, wv, wo;
+  generic_tensor w1, w2, w3;
+  tensor4d<__half> ffn_norm, attn_norm;
+};
+
 struct llama_model_impl : public llama_model {
   llama_model_impl(llama_params params, llama_partition partition)
-      : llama_model(params, partition) {
-    {
-      scoped_gpu g(partition.embedding_gpu);
-      tok_embeddings = tensor4d<__half>(1, 1, params.n_vocab, params.dim);
-    }
-    {
-      scoped_gpu g(partition.output_gpu);
-      output = tensor4d<__half>(1, 1, params.n_vocab, params.dim);
-      norm = tensor4d<__half>(1, 1, 1, params.dim);
-    }
-    for (int i = 0; i < params.n_layers; ++i) {
-      scoped_gpu g(partition.layer_gpus[i]);
-      layers.emplace_back();
-      auto& layer = layers.back();
-      layer.wk = tensor4d<__half>(1, 1, params.dim, params.dim);
-      layer.wq = tensor4d<__half>(1, 1, params.dim, params.dim);
-      layer.wv = tensor4d<__half>(1, 1, params.dim, params.dim);
-      layer.wo = tensor4d<__half>(1, 1, params.dim, params.dim);
-      layer.ffn_norm = tensor4d<__half>(1, 1, 1, params.dim);
-      layer.attn_norm = tensor4d<__half>(1, 1, 1, params.dim);
-      layer.w1 = tensor4d<__half>(1, 1, params.ffn_dim(), params.dim);
-      layer.w2 = tensor4d<__half>(1, 1, params.dim, params.ffn_dim());
-      layer.w3 = tensor4d<__half>(1, 1, params.ffn_dim(), params.dim);
-    }
-  }
+      : llama_model(params, partition) {}
   bool load_impl(std::string const& path) {
     {
       scoped_gpu g(partition.embedding_gpu);
@@ -788,9 +811,10 @@ struct llama_model_impl : public llama_model {
       RETURN_UNLESS(load_tensor(output, path, "output", params.n_vocab, params.dim));
       RETURN_UNLESS(load_tensor(norm, path, "norm", params.dim));
     }
+    layers.clear();
     for (int i = 0; i < params.n_layers; ++i) {
       scoped_gpu g(partition.layer_gpus[i]);
-      auto& layer = layers[i];
+      llama_layer layer;
       std::string basename = "layers." + std::to_string(i) + ".";
       RETURN_UNLESS(load_tensor(layer.attn_norm, path, basename + "attention_norm", params.dim));
       RETURN_UNLESS(load_tensor(layer.ffn_norm, path, basename + "ffn_norm", params.dim));
@@ -804,33 +828,64 @@ struct llama_model_impl : public llama_model {
           load_tensor(layer.w2, path, basename + "feed_forward.w2", params.dim, params.ffn_dim()));
       RETURN_UNLESS(
           load_tensor(layer.w3, path, basename + "feed_forward.w3", params.ffn_dim(), params.dim));
+      layers.emplace_back(std::move(layer));
     }
     return true;
   }
-  tensor4d<__half> tok_embeddings;
+  generic_tensor tok_embeddings;
   tensor4d<__half> norm;
-  tensor4d<__half> output;
+  generic_tensor output;
   std::vector<llama_layer> layers;
 
  private:
-  bool load_tensor(tensor4d<__half>& tensor,
+  bool load_tensor(generic_tensor& tensor,
                    std::string const& path,
                    std::string const& name,
                    size_t h,
                    size_t w) {
-    mapped_buffer buf(path + "/" + name + ".weight__" + std::to_string(h) + "_" +
-                      std::to_string(w));
-    if (!buf.is_ok() || buf.size() != tensor.gpu.size()) {
-      fprintf(stderr, "failed to load tensor %s (%zu x %zu)\n", name.c_str(), h, w);
-      return false;
+    if (params.q_type == quantization_type::fp16) {
+      tensor4d<half> t_fp16(1, 1, h, w);
+      mapped_buffer buf(path + "/" + name + ".weight__" + std::to_string(h) + "_" +
+                        std::to_string(w));
+      if (!buf.is_ok() || buf.size() != t_fp16.gpu.size()) {
+        fprintf(stderr, "failed to load tensor %s (%zu x %zu)\n", name.c_str(), h, w);
+        return false;
+      }
+      t_fp16.gpu.copy_from(buf);
+      tensor = std::move(t_fp16);
+      return true;
+    } else if (params.q_type == quantization_type::uint8) {
+      quantized_tensor quant;
+      quant.q_values = tensor4d<uint8_t>(1, 1, h, w);
+      quant.scales = tensor4d<half>(1, 1, h, w / params.quantization_block_size);
+      quant.q_type = params.q_type;
+      quant.quantization_block_size = params.quantization_block_size;
+      mapped_buffer weight_buf(path + "/" + name + ".weight__" + std::to_string(h) + "_" +
+                               std::to_string(w));
+      if (!weight_buf.is_ok() || weight_buf.size() != quant.q_values.gpu.size()) {
+        fprintf(stderr, "failed to load tensor %s (%zu x %zu)\n", name.c_str(), h, w);
+        return false;
+      }
+      quant.q_values.gpu.copy_from(weight_buf);
+      mapped_buffer scale_buf(path + "/" + name + ".scale__" + std::to_string(h) + "_" +
+                              std::to_string(w / params.quantization_block_size));
+      if (!scale_buf.is_ok() || scale_buf.size() != quant.scales.gpu.size()) {
+        fprintf(stderr, "failed to load tensor scale %s (%zu x %zu)\n", name.c_str(), h,
+                w / params.quantization_block_size);
+        return false;
+      }
+      quant.scales.gpu.copy_from(scale_buf);
+      tensor = std::move(quant);
+      return true;
     }
-    tensor.gpu.copy_from(buf);
-    return true;
+    fprintf(stderr, "Unsupported quantization type %d\n", (int)params.q_type);
+    return false;
   }
-  bool load_tensor(tensor4d<__half>& tensor,
+  bool load_tensor(tensor4d<half>& tensor,
                    std::string const& path,
                    std::string const& name,
                    size_t w) {
+    tensor = tensor4d<half>(1, 1, 1, w);
     mapped_buffer buf(path + "/" + name + ".weight__" + std::to_string(w));
     if (!buf.is_ok() || buf.size() != tensor.gpu.size()) {
       fprintf(stderr, "failed to load tensor %s\n", name.c_str());
@@ -939,9 +994,17 @@ struct llama_context_impl final : public llama_context {
     auto v_embed = embed_ctx.t_embed.view().take(1, 1, new_tokens.size(), model_->params.dim);
     auto v_logits = t_logits_.view().take(1, 1, 1, model_->params.n_vocab);
     v_tokens.gpu.copy_from(new_tokens.data(), new_tokens.size() * sizeof(short));
-    kernel::embed<<<ceil_div(new_tokens.size(), 256), 256>>>(model_->params.dim, new_tokens.size(),
-                                                             v_tokens.data(), v_embed.data(),
-                                                             model_->tok_embeddings.data());
+    if (model_->tok_embeddings.is_quantized()) {
+      auto& t_quant = model_->tok_embeddings.as_quantized();
+      // TODO: this is the exact sort of if statement that's going to cause trouble later.
+      kernel::embed_uint8<<<ceil_div(new_tokens.size(), 256), 256>>>(
+          model_->params.dim, new_tokens.size(), v_tokens.data(), v_embed.data(),
+          t_quant.q_values.data(), t_quant.scales.data(), t_quant.quantization_block_size);
+    } else {
+      kernel::embed<<<ceil_div(new_tokens.size(), 256), 256>>>(
+          model_->params.dim, new_tokens.size(), v_tokens.data(), v_embed.data(),
+          model_->tok_embeddings.as_fp16().data());
+    }
     CHECK_CUDA(cudaGetLastError());
     for (int cur_layer = 0; cur_layer < model_->layers.size(); ++cur_layer) {
       auto cur_layer_gpu_idx = model_->partition.layer_gpus[cur_layer];
@@ -1341,6 +1404,23 @@ void matmul_nt(tensor4d_view<__half> out,
       assert(false && "invalid matmul type");
   }
   CHECK_CUDA(cudaGetLastError());
+}
+
+void matmul_nt(tensor4d_view<__half> out,
+               tensor4d_view<__half> lhs,
+               generic_tensor& rhs,
+               __half beta,
+               cudaStream_t stream) {
+  if (rhs.is_quantized()) {
+    auto& t_quant = rhs.as_quantized();
+    dim3 grid(ceil_div(t_quant.q_values.h, 32), ceil_div(lhs.h, 32)), block(32, 32);
+    kernel::matmul_nt_fp16u8<<<grid, block, 0, stream>>>(
+        out.data(), lhs.data(), t_quant.q_values.data(), t_quant.scales.data(), lhs.h, lhs.w,
+        t_quant.q_values.h, t_quant.quantization_block_size, beta);
+    // TODO: optimized kernels.
+  } else {
+    matmul_nt(out, lhs, rhs.as_fp16().view(), beta, stream);
+  }
 }
 
 void initialize() {

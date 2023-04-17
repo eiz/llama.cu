@@ -28,6 +28,8 @@
 
 #ifdef LLAMA_CU_IMPLEMENTATION
 
+#include <variant>
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -130,6 +132,11 @@ struct gpu_buffer : public gpu_buffer_view {
   gpu_buffer& operator=(gpu_buffer const&) = delete;
 };
 
+enum class quantization_type : uint8_t {
+  fp16,
+  uint8,
+};
+
 #ifdef LLAMA_CU_IMPLEMENTATION
 
 template <typename T>
@@ -229,16 +236,31 @@ struct tensor4d {
   operator tensor4d_view<T>() { return tensor4d_view<T>(n, c, h, w, c * h * w, h * w, w, gpu); }
   tensor4d_view<T> view() { return *this; }
   T* data() { return reinterpret_cast<T*>(gpu.data()); }
+  T const* data() const { return reinterpret_cast<T const*>(gpu.data()); }
   size_t n, c, h, w;
   gpu_buffer gpu;
 };
 
-#endif  // LLAMA_CU_IMPLEMENTATION
-
-enum class llama_quantization_type : uint8_t {
-  fp16,
-  uint8,
+struct quantized_tensor {
+  tensor4d<uint8_t> q_values;
+  tensor4d<half> scales;
+  quantization_type q_type{quantization_type::fp16};
+  uint16_t quantization_block_size{0};
 };
+
+struct generic_tensor {
+  std::variant<tensor4d<half>, quantized_tensor> v;
+  generic_tensor() {}
+  generic_tensor(tensor4d<half> t) : v(std::move(t)) {}
+  generic_tensor(quantized_tensor t) : v(std::move(t)) {}
+  bool is_quantized() const { return std::holds_alternative<quantized_tensor>(v); }
+  tensor4d<half>& as_fp16() { return std::get<tensor4d<half>>(v); }
+  quantized_tensor& as_quantized() { return std::get<quantized_tensor>(v); }
+  tensor4d<half> const& as_fp16() const { return std::get<tensor4d<half>>(v); }
+  quantized_tensor const& as_quantized() const { return std::get<quantized_tensor>(v); }
+};
+
+#endif  // LLAMA_CU_IMPLEMENTATION
 
 #define LLAMA_CU_MAGIC 0x000041524F525541       // "AURORA\0\0" little endian
 #define LLAMA_CU_MODEL_FOURCC_LLAMA 0x414D4C4C  // "LLMA" little endian
@@ -255,7 +277,7 @@ struct llama_params {
   uint32_t n_layers;
   uint32_t n_vocab;
   float norm_eps;
-  llama_quantization_type quantization_type;
+  quantization_type q_type;
   uint8_t reserved0[1];
   uint16_t quantization_block_size;
   bool load(mapped_buffer const& buffer);
