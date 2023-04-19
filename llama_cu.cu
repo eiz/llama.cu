@@ -766,9 +766,20 @@ uint32_t llama_params::ffn_dim() const {
   return round_up(dim * 8 / 3, multiple_of);
 }
 size_t llama_params::layer_size() const {
-  size_t attn_weights = 4 * dim * dim * sizeof(__half);
   size_t norms = 2 * dim * sizeof(__half);
-  size_t ffn_weights = 3 * ffn_dim() * dim * sizeof(__half);
+  size_t attn_weights, ffn_weights;
+  if (q_type == quantization_type::fp16) {
+    attn_weights = 4 * dim * dim * sizeof(__half);
+    ffn_weights = 3 * ffn_dim() * dim * sizeof(__half);
+  } else if (q_type == quantization_type::uint8) {
+    attn_weights =
+        4 * dim * dim * sizeof(uint8_t) + (dim / quantization_block_size * dim) * sizeof(__half);
+    ffn_weights = 3 * ffn_dim() * dim * sizeof(uint8_t) +
+                  (ffn_dim() / quantization_block_size * dim) * sizeof(__half) +
+                  (dim / quantization_block_size * ffn_dim()) * sizeof(__half) * 2;
+  } else {
+    assert(false && "unsupported quantization type");
+  }
   return attn_weights + norms + ffn_weights;
 }
 size_t llama_params::embedding_size() const {
@@ -1188,14 +1199,14 @@ struct llama_context_impl final : public llama_context {
     CHECK_CUDA(cudaMemcpy(probs.data(), v_logits.data(), v_logits.w * sizeof(__half),
                           cudaMemcpyDeviceToHost));
     start_pos_ += new_tokens.size();
-    // std::discrete_distribution<short> dist(probs.begin(), probs.end());
-    // return dist(rng_);
+    std::discrete_distribution<short> dist(probs.begin(), probs.end());
+    return dist(rng_);
 
-    auto argmax = std::max_element(probs.begin(), probs.end(), [](__half lhs, __half rhs) {
-      return __half2float(lhs) < __half2float(rhs);
-    });
+    // auto argmax = std::max_element(probs.begin(), probs.end(), [](__half lhs, __half rhs) {
+    // return __half2float(lhs) < __half2float(rhs);
+    //});
 
-    return std::distance(probs.begin(), argmax);
+    // return std::distance(probs.begin(), argmax);
   }
 
  private:

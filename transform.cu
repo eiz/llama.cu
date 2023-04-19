@@ -152,10 +152,6 @@ bool quantize_one(std::string const& input_model,
       output.data(), scales.data(), input.data(), h, w, block_size);
   dequantize_absmax_uint8<<<dim3(w / block_size, h), std::min(block_size, 1024)>>>(
       output_dequantized.data(), scales.data(), output.data(), h, w, block_size);
-  if (name == "tok_embeddings") {
-    input.view().debug_print("tok_embeddings");
-    output_dequantized.view().debug_print("tok_embeddings_dequantized");
-  }
   error_stats<<<128, 1024>>>(error.data(), input.data(), output_dequantized.data(), h * w);
   float host_error[3];
   error.gpu.copy_to(&host_error, sizeof(float) * 3);
@@ -368,31 +364,31 @@ int main(int argc, char** argv) {
   if (operation == "quantize") {
     std::string output_model_name = "filthy_instruct_v6_q8";
     if (argc > 3) {
-      output_model_name = argv[2];
+      output_model_name = argv[3];
     }
     int block_size = 128;
     if (argc > 4) {
-      block_size = atoi(argv[3]);
+      block_size = atoi(argv[4]);
     }
     return do_quantize(input_model_name, output_model_name, params, block_size) == false;
   } else if (operation == "histogram") {
     std::string tensor_name = "attention.wq";
     if (argc > 3) {
-      tensor_name = argv[2];
+      tensor_name = argv[3];
     }
     int layer_index = 0;
     if (argc > 4) {
-      layer_index = atoi(argv[3]);
+      layer_index = atoi(argv[4]);
     }
     return do_histogram(input_model_name, params, tensor_name, layer_index) == false;
   } else if (operation == "svd") {
     std::string tensor_name = "attention.wq";
     if (argc > 3) {
-      tensor_name = argv[2];
+      tensor_name = argv[3];
     }
     int layer_index = 0;
     if (argc > 4) {
-      layer_index = atoi(argv[3]);
+      layer_index = atoi(argv[4]);
     }
     return do_svd(input_model_name, params, tensor_name, layer_index) == false;
   } else {
