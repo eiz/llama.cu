@@ -67,6 +67,8 @@ __global__ void dequantize_absmax_uint8(half* output,
 }
 
 // https://stackoverflow.com/a/51549250
+// technically this does not handle nan properly but those dont exist right
+// actually my sums are always positive so you dont even need the negative case
 __device__ __forceinline__ float atomic_max_float(float* addr, float value) {
   float old;
   old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
