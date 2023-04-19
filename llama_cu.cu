@@ -340,10 +340,12 @@ __global__ void matmul_nt_wmma_16x128x256_fp16u8(half* __restrict__ output,
           __ldg(&rhs_scale[(bx + thi * 32 + i) * block_count + (t + tlo * 4) / block_size]);
       int rhs_idx = (bx + thi * 32 + i) * p + t + tlo * 4;
       uint32_t rhs_unscaled = *((uint32_t*)&rhs[rhs_idx]);
+      half rhs_scaled[4];
       for (int j = 0; j < 4; ++j) {
-        RHS(thi * 32 + i, tlo * 4 + j) = dequantize_absmax_one(rhs_unscaled & 0xFF, scale);
+        rhs_scaled[j] = dequantize_absmax_one(rhs_unscaled & 0xFF, scale);
         rhs_unscaled >>= 8;
       }
+      *((short4*)&RHS(thi * 32 + i, tlo * 4)) = *(short4*)rhs_scaled;
     }
     __syncthreads();
     for (int i = 0; i < 256; i += 16) {
