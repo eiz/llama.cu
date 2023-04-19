@@ -335,6 +335,7 @@ __global__ void matmul_nt_wmma_16x128x256_fp16u8(half* __restrict__ output,
       int lhs_idx = (by + thi * 4 + i) * p + t + tlo * 4;
       *((short4*)&LHS(thi * 4 + i, tlo * 4)) = *(short4*)(&lhs[lhs_idx]);
     }
+#pragma unroll
     for (int i = 0; i < 32; ++i) {
       half scale =
           __ldg(&rhs_scale[(bx + thi * 32 + i) * block_count + (t + tlo * 4) / block_size]);
