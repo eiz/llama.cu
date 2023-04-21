@@ -1,9 +1,26 @@
 #define LLAMA_CU_IMPLEMENTATION
 #include "llama_cu.h"
 
+#ifdef ENABLE_CUBLAS
+#include <cublas_v2.h>
+#endif
+
+#ifdef ENABLE_CUSOLVER
+#include <cusolverDn.h>
+#endif
+
 #include <cuda_fp16.h>
 
 namespace llama_cu {
+// TODO: bad kernel (no tiling)
+__global__ void half2float_transpose(float* output, half* input, int h, int w) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x < w && y < h) {
+    output[x * h + y] = __half2float(input[y * w + x]);
+  }
+}
+
 // atm there's no reason to do this on the gpu, but i want it for later
 __global__ void quantize_absmax_uint8(uint8_t* output,
                                       half* scales,
@@ -242,14 +259,13 @@ bool do_quantize(const std::string& input_model,
   return true;
 }
 
-template <typename T>
-bool load_tensor_by_address(tensor4d<T>& output,
+bool load_tensor_by_address(generic_tensor& output,
                             std::string const& input_model,
                             llama_params const& params,
                             std::string const& tensor_name,
-                            std::string const& part_name,
                             int layer_index) {
   size_t h, w;
+  bool is_quantized = params.q_type != quantization_type::fp16;
   if (tensor_name == "tok_embeddings" || tensor_name == "output") {
     h = params.n_vocab;
     w = params.dim;
@@ -271,23 +287,36 @@ bool load_tensor_by_address(tensor4d<T>& output,
     fprintf(stderr, "Unknown tensor name %s\n", tensor_name.c_str());
     return false;
   }
-  if (part_name == "scale") {
-    if (params.q_type == quantization_type::fp16) {
-      fprintf(stderr, "Cannot load scale for fp16 model\n");
-      return false;
-    }
-    w /= params.quantization_block_size;
-  }
-  mapped_buffer buf("models/" + input_model + "/" +
-                    (layer_index >= 0 ? "layers." + std::to_string(layer_index) + "." : "") +
-                    tensor_name + "." + part_name + "__" +
-                    ((h > 1) ? std::to_string(h) + "_" : "") + std::to_string(w));
-  if (!buf.is_ok()) {
+  auto prefix = "models/" + input_model + "/" +
+                (layer_index >= 0 ? "layers." + std::to_string(layer_index) + "." : "") +
+                tensor_name + ".";
+  auto suffix = "__" + ((h > 1) ? std::to_string(h) + "_" : "") + std::to_string(w);
+  mapped_buffer weight_buf(prefix + "weight" + suffix);
+  mapped_buffer scale_buf;
+  if (!weight_buf.is_ok()) {
     fprintf(stderr, "Failed to load tensor %s\n", tensor_name.c_str());
     return false;
   }
-  output = tensor4d<T>(1, 1, h, w);
-  output.gpu.copy_from(buf);
+  if (is_quantized) {
+    scale_buf = mapped_buffer(prefix + "scale" + suffix);
+    if (!scale_buf.is_ok()) {
+      fprintf(stderr, "Failed to load tensor %s\n", tensor_name.c_str());
+      return false;
+    }
+    quantized_tensor quant;
+    tensor4d<uint8_t> t_values(1, 1, h, w);
+    t_values.gpu.copy_from(weight_buf);
+    tensor4d<half> t_scales(1, 1, h, w / params.quantization_block_size);
+    t_scales.gpu.copy_from(scale_buf);
+    quant.q_type = params.q_type;
+    quant.q_values = std::move(t_values);
+    quant.scales = std::move(t_scales);
+    output = std::move(quant);
+  } else {
+    tensor4d<half> t_result(1, 1, h, w);
+    t_result.gpu.copy_from(weight_buf);
+    output = std::move(t_result);
+  }
   return true;
 }
 
@@ -299,14 +328,19 @@ bool do_histogram(const std::string& input_model,
     fprintf(stderr, "Input model is not uint8\n");
     return false;
   }
-  tensor4d<uint8_t> weights;
-  if (!load_tensor_by_address(weights, input_model, params, tensor_name, "weight", layer_index)) {
+  generic_tensor weights;
+  if (!load_tensor_by_address(weights, input_model, params, tensor_name, layer_index)) {
     fprintf(stderr, "Failed to load weights for %s\n", tensor_name.c_str());
   }
-  uint8_t* yes_this_is_silly = reinterpret_cast<uint8_t*>(malloc(weights.gpu.size()));
-  weights.gpu.copy_to(yes_this_is_silly, weights.gpu.size());
+  if (!weights.is_quantized()) {
+    fprintf(stderr, "Input tensor is not quantized\n");
+    return false;
+  }
+  auto& quant = weights.as_quantized();
+  uint8_t* yes_this_is_silly = reinterpret_cast<uint8_t*>(malloc(quant.q_values.gpu.size()));
+  quant.q_values.gpu.copy_to(yes_this_is_silly, quant.q_values.gpu.size());
   uint32_t histogram[256] = {};
-  for (size_t i = 0; i < weights.gpu.size(); ++i) {
+  for (size_t i = 0; i < quant.q_values.gpu.size(); ++i) {
     histogram[yes_this_is_silly[i]]++;
   }
   printf("      ");
@@ -325,19 +359,50 @@ bool do_histogram(const std::string& input_model,
   return true;
 }
 
+#if defined(ENABLE_CUBLAS) && defined(ENABLE_CUSOLVER)
 bool do_svd(const std::string& input_model,
             const llama_params& params,
             const std::string& tensor_name,
             int layer_index) {
-  tensor4d<uint8_t> weights;
-
-  if (!load_tensor_by_address(weights, input_model, params, tensor_name, "weight", layer_index)) {
+  generic_tensor weights;
+  if (!load_tensor_by_address(weights, input_model, params, tensor_name, layer_index)) {
     fprintf(stderr, "Failed to load weights for %s\n", tensor_name.c_str());
   }
-
-  // TODO
-  return false;
+  cublasHandle_t cublas_handle;
+  cublasCreate(&cublas_handle);
+  cusolverDnHandle_t cusolver_handle;
+  cusolverDnCreate(&cusolver_handle);
+  if (weights.is_quantized()) {
+    auto& quant = weights.as_quantized();
+    tensor4d<half> output_dequantized(1, 1, quant.q_values.h, quant.q_values.w);
+    dequantize_absmax_uint8<<<dim3(quant.q_values.w / params.quantization_block_size,
+                                   quant.q_values.h),
+                              std::min<int>(params.quantization_block_size, 1024)>>>(
+        output_dequantized.data(), quant.scales.data(), quant.q_values.data(), quant.q_values.h,
+        quant.q_values.w, params.quantization_block_size);
+    weights = std::move(output_dequantized);
+  }
+  auto& t_weights = weights.as_fp16();
+  tensor4d<float> t_weights_transposed(1, 1, t_weights.w, t_weights.h);
+  half2float_transpose<<<dim3(t_weights.w / 32, t_weights.h / 32), dim3(32, 32)>>>(
+      t_weights_transposed.data(), t_weights.data(), t_weights.h, t_weights.w);
+  tensor4d<float> t_u(1, 1, t_weights.h, t_weights.h);
+  tensor4d<float> t_v(1, 1, t_weights.w, t_weights.w);
+  tensor4d<float> t_s(1, 1, std::min(t_weights.h, t_weights.w), 1);
+  tensor4d<float> rwork(1, 1, 1, std::min(t_weights.h, t_weights.w) - 1);
+  int lwork = 0;
+  tensor4d<int> dev_info(1, 1, 1, 1);
+  cusolverDnSgesvd_bufferSize(cusolver_handle, t_weights.w, t_weights.h, &lwork);
+  tensor4d<float> d_work(1, 1, 1, lwork);
+  cusolverDnSgesvd(cusolver_handle, 'A', 'A', t_weights.w, t_weights.h, t_weights_transposed.data(),
+                   t_weights.w, t_s.data(), t_u.data(), t_weights.h, t_v.data(), t_weights.w,
+                   d_work.data(), lwork, rwork.data(), dev_info.data());
+  t_s.view().debug_print("t_s");
+  cusolverDnDestroy(cusolver_handle);
+  cublasDestroy(cublas_handle);
+  return true;
 }
+#endif  // ENABLE_CUBLAS && ENABLE_CUSOLVER
 
 }  // namespace llama_cu
 
@@ -381,7 +446,9 @@ int main(int argc, char** argv) {
       layer_index = atoi(argv[4]);
     }
     return do_histogram(input_model_name, params, tensor_name, layer_index) == false;
-  } else if (operation == "svd") {
+  }
+#if defined(ENABLE_CUBLAS) && defined(ENABLE_CUSOLVER)
+  else if (operation == "svd") {
     std::string tensor_name = "attention.wq";
     if (argc > 3) {
       tensor_name = argv[3];
@@ -391,7 +458,9 @@ int main(int argc, char** argv) {
       layer_index = atoi(argv[4]);
     }
     return do_svd(input_model_name, params, tensor_name, layer_index) == false;
-  } else {
+  }
+#endif  // ENABLE_CUBLAS && ENABLE_CUSOLVER
+  else {
     fprintf(stderr, "Unknown operation: %s\n", operation.c_str());
   }
   return 0;

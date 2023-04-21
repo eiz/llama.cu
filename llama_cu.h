@@ -68,6 +68,7 @@ namespace llama_cu {
 extern LLAMA_CU_API int matmul_type;
 
 struct mapped_buffer {
+  mapped_buffer();
   mapped_buffer(std::string const& path);
   mapped_buffer(std::string const& path, size_t size);
   mapped_buffer(size_t size);

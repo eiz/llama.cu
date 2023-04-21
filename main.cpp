@@ -77,7 +77,7 @@ int main(int argc, char const** argv) {
   std::vector<float> token_times;
   std::vector<short> complete_tokens = tokens;
   start = monoclock::now();
-  while (true) {
+  while (tokens_generated < 200) {
     monoclock::time_point token_start, token_end;
     token_start = monoclock::now();
     if (context->tokens_left() == 0) {

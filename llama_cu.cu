@@ -547,6 +547,14 @@ __global__ void silu(__half* output, __half* lhs, __half* rhs, int size) {
 }
 }  // namespace kernel
 
+mapped_buffer::mapped_buffer()
+    : fd_(invalid_file),
+#if defined(_WIN32)
+      mapping_(nullptr),
+#endif
+      ptr_(nullptr),
+      size_(0) {
+}
 mapped_buffer::mapped_buffer(std::string const& path) {
 #if defined(_WIN32)
   // TODO(eiz): support things other than america letters
@@ -1199,14 +1207,14 @@ struct llama_context_impl final : public llama_context {
     CHECK_CUDA(cudaMemcpy(probs.data(), v_logits.data(), v_logits.w * sizeof(__half),
                           cudaMemcpyDeviceToHost));
     start_pos_ += new_tokens.size();
-    std::discrete_distribution<short> dist(probs.begin(), probs.end());
-    return dist(rng_);
+    // std::discrete_distribution<short> dist(probs.begin(), probs.end());
+    // return dist(rng_);
 
-    // auto argmax = std::max_element(probs.begin(), probs.end(), [](__half lhs, __half rhs) {
-    // return __half2float(lhs) < __half2float(rhs);
-    //});
+    auto argmax = std::max_element(probs.begin(), probs.end(), [](__half lhs, __half rhs) {
+      return __half2float(lhs) < __half2float(rhs);
+    });
 
-    // return std::distance(probs.begin(), argmax);
+    return std::distance(probs.begin(), argmax);
   }
 
  private:

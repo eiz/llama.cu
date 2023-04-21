@@ -23,13 +23,17 @@ On either platform, you can speed things up by setting the `ENABLE_CUBLAS` CMake
 Recent additions:
 
 * Added pipeline parallel multi-GPU support. Can now load 30B in fp16 on my 4090/6000 box.
+* Added basic int8 quantization support. Can now load 30B in int8 on just the 6000. Haven't implemented benchmarks yet but top-1 samples appear to be identical between the quantized and unquantized versions. Error stats look sane'ish. I think I can probably get rid of the block size and just go vector-wise.
 
 There's some big TODOs right now:
 
-* make an actual CLI lol
+* ~~make an actual CLI lol~~ never going to happen
 * matmul_qk / matmul_qkv need tiled implementations (they are very slow) & cuBLAS equivalents with explicit transposes
-* add quantization support (big refactor)
-* matmuls should use pipelining to load from global memory
+** better: implement a fused attention kernel
+* matmuls should use pipelining to overlap loads/muls
+* implement batching
+* refuxor kernels to make them a bit more reusable
+* test 16bit decomposition method from LLM.int8 for them int8 wmmas
 * clean up extract.py / add support for common model file formats
 * test 65 model on a sufficiently large computer
 * implement a more proper sampler
