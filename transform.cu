@@ -413,6 +413,21 @@ void svd(tensor4d<float>& out_u,
   out_s = std::move(t_s);
 }
 
+void print_svd(tensor4d<float>& t_s) {
+  float* host_data = (float*)malloc(sizeof(float) * t_s.h);
+  t_s.gpu.copy_to(host_data, sizeof(float) * t_s.h);
+  float sum = 0.0;
+  float cumsum = 0.0;
+  for (int i = 0; i < t_s.h; ++i) {
+    sum += host_data[i];
+  }
+  for (int i = 0; i < t_s.h; ++i) {
+    cumsum += host_data[i];
+    printf("%5d: %f (so far: %.2f%%)\n", i, host_data[i], cumsum / sum * 100.0);
+  }
+  free(host_data);
+}
+
 bool do_svd(const std::string& input_model,
             const llama_params& params,
             const std::string& tensor_name,
@@ -420,10 +435,11 @@ bool do_svd(const std::string& input_model,
   generic_tensor weights;
   if (!load_tensor_by_address(weights, input_model, params, tensor_name, layer_index)) {
     fprintf(stderr, "Failed to load weights for %s\n", tensor_name.c_str());
+    return false;
   }
   tensor4d<float> t_u, t_v, t_s;
   svd(t_u, t_v, t_s, weights);
-  t_s.view().debug_print("t_s");
+  print_svd(t_s);
   return true;
 }
 
@@ -459,10 +475,12 @@ bool do_compare_svd(const std::string& base_model,
   generic_tensor base_weights, finetune_weights;
   if (!load_tensor_by_address(base_weights, base_model, base_params, tensor_name, layer_index)) {
     fprintf(stderr, "Failed to load base weights for %s\n", tensor_name.c_str());
+    return false;
   }
   if (!load_tensor_by_address(finetune_weights, finetune_model, finetune_params, tensor_name,
                               layer_index)) {
     fprintf(stderr, "Failed to load finetune weights for %s\n", tensor_name.c_str());
+    return false;
   }
   dequantize(base_weights);
   dequantize(finetune_weights);
@@ -472,7 +490,7 @@ bool do_compare_svd(const std::string& base_model,
   finetune_weights.as_fp16().view().debug_print("finetune_weights - base_weights");
   tensor4d<float> t_u, t_v, t_s;
   svd(t_u, t_v, t_s, finetune_weights);
-  t_s.view().debug_print("t_s");
+  print_svd(t_s);
   return true;
 }
 #endif  // ENABLE_CUBLAS && ENABLE_CUSOLVER
