@@ -139,6 +139,13 @@ enum class quantization_type : uint8_t {
 };
 
 #ifdef LLAMA_CU_IMPLEMENTATION
+__device__ __host__ __forceinline__ size_t ceil_div(size_t a, size_t b) {
+  return (a + b - 1) / b;
+}
+
+__device__ __host__ __forceinline__ size_t round_up(size_t a, size_t b) {
+  return ceil_div(a, b) * b;
+}
 
 template <typename T>
 inline float to_float(T other_float);
@@ -255,6 +262,7 @@ struct generic_tensor {
   generic_tensor(tensor4d<half> t) : v(std::move(t)) {}
   generic_tensor(quantized_tensor t) : v(std::move(t)) {}
   bool is_quantized() const { return std::holds_alternative<quantized_tensor>(v); }
+  bool is_fp16() const { return std::holds_alternative<tensor4d<half>>(v); }
   tensor4d<half>& as_fp16() { return std::get<tensor4d<half>>(v); }
   quantized_tensor& as_quantized() { return std::get<quantized_tensor>(v); }
   tensor4d<half> const& as_fp16() const { return std::get<tensor4d<half>>(v); }

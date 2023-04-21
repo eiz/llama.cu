@@ -1,5 +1,8 @@
 #define LLAMA_CU_IMPLEMENTATION
 #include "llama_cu.h"
+#undef NDEBUG
+
+#include <cassert>
 
 #ifdef ENABLE_CUBLAS
 #include <cublas_v2.h>
@@ -360,29 +363,30 @@ bool do_histogram(const std::string& input_model,
 }
 
 #if defined(ENABLE_CUBLAS) && defined(ENABLE_CUSOLVER)
-bool do_svd(const std::string& input_model,
-            const llama_params& params,
-            const std::string& tensor_name,
-            int layer_index) {
-  generic_tensor weights;
-  if (!load_tensor_by_address(weights, input_model, params, tensor_name, layer_index)) {
-    fprintf(stderr, "Failed to load weights for %s\n", tensor_name.c_str());
+void dequantize(generic_tensor& input) {
+  if (input.is_quantized()) {
+    auto& quant = input.as_quantized();
+    tensor4d<half> output_dequantized(1, 1, quant.q_values.h, quant.q_values.w);
+    dequantize_absmax_uint8<<<dim3(quant.q_values.w / quant.quantization_block_size,
+                                   quant.q_values.h),
+                              std::min<int>(quant.quantization_block_size, 1024)>>>(
+        output_dequantized.data(), quant.scales.data(), quant.q_values.data(), quant.q_values.h,
+        quant.q_values.w, quant.quantization_block_size);
+    input = std::move(output_dequantized);
   }
+}
+
+void svd(tensor4d<float>& out_u,
+         tensor4d<float>& out_v,
+         tensor4d<float>& out_s,
+         generic_tensor& input) {
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
   cusolverDnHandle_t cusolver_handle;
   cusolverDnCreate(&cusolver_handle);
-  if (weights.is_quantized()) {
-    auto& quant = weights.as_quantized();
-    tensor4d<half> output_dequantized(1, 1, quant.q_values.h, quant.q_values.w);
-    dequantize_absmax_uint8<<<dim3(quant.q_values.w / params.quantization_block_size,
-                                   quant.q_values.h),
-                              std::min<int>(params.quantization_block_size, 1024)>>>(
-        output_dequantized.data(), quant.scales.data(), quant.q_values.data(), quant.q_values.h,
-        quant.q_values.w, params.quantization_block_size);
-    weights = std::move(output_dequantized);
-  }
-  auto& t_weights = weights.as_fp16();
+  dequantize(input);
+  assert(input.is_fp16());
+  auto& t_weights = input.as_fp16();
   tensor4d<float> t_weights_transposed(1, 1, t_weights.w, t_weights.h);
   half2float_transpose<<<dim3(t_weights.w / 32, t_weights.h / 32), dim3(32, 32)>>>(
       t_weights_transposed.data(), t_weights.data(), t_weights.h, t_weights.w);
@@ -394,17 +398,100 @@ bool do_svd(const std::string& input_model,
   tensor4d<int> dev_info(1, 1, 1, 1);
   cusolverDnSgesvd_bufferSize(cusolver_handle, t_weights.w, t_weights.h, &lwork);
   tensor4d<float> d_work(1, 1, 1, lwork);
-  cusolverDnSgesvd(cusolver_handle, 'A', 'A', t_weights.w, t_weights.h, t_weights_transposed.data(),
-                   t_weights.w, t_s.data(), t_u.data(), t_weights.h, t_v.data(), t_weights.w,
-                   d_work.data(), lwork, rwork.data(), dev_info.data());
-  t_s.view().debug_print("t_s");
+  cusolverStatus_t status;
+  status = cusolverDnSgesvd(cusolver_handle, 'A', 'A', t_weights.h, t_weights.w,
+                            t_weights_transposed.data(), t_weights.h, t_s.data(), t_u.data(), t_u.h,
+                            t_v.data(), t_v.h, d_work.data(), lwork, rwork.data(), dev_info.data());
+  if (status != 0) {
+    fprintf(stderr, "SVD failed with status %d\n", status);
+    exit(1);
+  }
   cusolverDnDestroy(cusolver_handle);
   cublasDestroy(cublas_handle);
+  out_u = std::move(t_u);
+  out_v = std::move(t_v);
+  out_s = std::move(t_s);
+}
+
+bool do_svd(const std::string& input_model,
+            const llama_params& params,
+            const std::string& tensor_name,
+            int layer_index) {
+  generic_tensor weights;
+  if (!load_tensor_by_address(weights, input_model, params, tensor_name, layer_index)) {
+    fprintf(stderr, "Failed to load weights for %s\n", tensor_name.c_str());
+  }
+  tensor4d<float> t_u, t_v, t_s;
+  svd(t_u, t_v, t_s, weights);
+  t_s.view().debug_print("t_s");
+  return true;
+}
+
+#define ELEMENTWISE_BINOP(name, expr)                                             \
+  namespace kernel {                                                              \
+  template <typename T>                                                           \
+  __global__ void elementwise_##name(T* a, T* b, size_t size) {                   \
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;                             \
+    if (i < size) {                                                               \
+      a[i] = expr;                                                                \
+    }                                                                             \
+  }                                                                               \
+  }                                                                               \
+  template <typename T>                                                           \
+  void elementwise_##name(tensor4d<T>& a, tensor4d<T>& b) {                       \
+    assert(a.h == b.h);                                                           \
+    assert(a.w == b.w);                                                           \
+    auto n = a.h * a.w;                                                           \
+    kernel::elementwise_##name<<<ceil_div(n, 256), 256>>>(a.data(), b.data(), n); \
+  }
+ELEMENTWISE_BINOP(add, a[i] + b[i])
+ELEMENTWISE_BINOP(sub, a[i] - b[i])
+ELEMENTWISE_BINOP(mul, a[i] * b[i])
+
+bool do_compare_svd(const std::string& base_model,
+                    const std::string& finetune_model,
+                    const llama_params& base_params,
+                    const llama_params& finetune_params,
+                    const std::string& tensor_name,
+                    int layer_index) {
+  printf("comparing %s/%s, layer %d, tensor %s\n", base_model.c_str(), finetune_model.c_str(),
+         layer_index, tensor_name.c_str());
+  generic_tensor base_weights, finetune_weights;
+  if (!load_tensor_by_address(base_weights, base_model, base_params, tensor_name, layer_index)) {
+    fprintf(stderr, "Failed to load base weights for %s\n", tensor_name.c_str());
+  }
+  if (!load_tensor_by_address(finetune_weights, finetune_model, finetune_params, tensor_name,
+                              layer_index)) {
+    fprintf(stderr, "Failed to load finetune weights for %s\n", tensor_name.c_str());
+  }
+  dequantize(base_weights);
+  dequantize(finetune_weights);
+  base_weights.as_fp16().view().debug_print("base_weights");
+  finetune_weights.as_fp16().view().debug_print("finetune_weights");
+  elementwise_sub(finetune_weights.as_fp16(), base_weights.as_fp16());
+  finetune_weights.as_fp16().view().debug_print("finetune_weights - base_weights");
+  tensor4d<float> t_u, t_v, t_s;
+  svd(t_u, t_v, t_s, finetune_weights);
+  t_s.view().debug_print("t_s");
   return true;
 }
 #endif  // ENABLE_CUBLAS && ENABLE_CUSOLVER
 
 }  // namespace llama_cu
+
+llama_cu::llama_params load_params(std::string const& input_model_name) {
+  llama_cu::mapped_buffer in_params_buf("models/" + input_model_name + "/params");
+  if (!in_params_buf.is_ok()) {
+    fprintf(stderr, "Could not load params file\n");
+    exit(1);
+  }
+  llama_cu::llama_params params;
+  if (!params.load(in_params_buf)) {
+    fprintf(stderr, "Invalid model parameters\n");
+    exit(1);
+  }
+  return params;
+}
 
 int main(int argc, char** argv) {
   llama_cu::initialize();
@@ -416,16 +503,7 @@ int main(int argc, char** argv) {
   if (argc > 2) {
     input_model_name = argv[2];
   }
-  llama_cu::mapped_buffer in_params_buf("models/" + input_model_name + "/params");
-  if (!in_params_buf.is_ok()) {
-    fprintf(stderr, "Could not load params file\n");
-    return 1;
-  }
-  llama_cu::llama_params params;
-  if (!params.load(in_params_buf)) {
-    fprintf(stderr, "Invalid model parameters\n");
-    return 1;
-  }
+  llama_cu::llama_params params = load_params(input_model_name);
   if (operation == "quantize") {
     std::string output_model_name = "filthy_instruct_v6_q8";
     if (argc > 3) {
@@ -458,6 +536,22 @@ int main(int argc, char** argv) {
       layer_index = atoi(argv[4]);
     }
     return do_svd(input_model_name, params, tensor_name, layer_index) == false;
+  } else if (operation == "compare_svd") {
+    std::string finetune_model_name = "filthy_instruct_v6";
+    if (argc > 3) {
+      finetune_model_name = argv[3];
+    }
+    llama_cu::llama_params finetune_params = load_params(finetune_model_name);
+    std::string tensor_name = "attention.wq";
+    if (argc > 4) {
+      tensor_name = argv[4];
+    }
+    int layer_index = 0;
+    if (argc > 5) {
+      layer_index = atoi(argv[5]);
+    }
+    return do_compare_svd(input_model_name, finetune_model_name, params, finetune_params,
+                          tensor_name, layer_index) == false;
   }
 #endif  // ENABLE_CUBLAS && ENABLE_CUSOLVER
   else {

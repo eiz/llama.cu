@@ -27,14 +27,6 @@
 namespace llama_cu {
 int matmul_type = 4;
 
-__device__ __host__ __forceinline__ size_t ceil_div(size_t a, size_t b) {
-  return (a + b - 1) / b;
-}
-
-__device__ __host__ __forceinline__ size_t round_up(size_t a, size_t b) {
-  return ceil_div(a, b) * b;
-}
-
 namespace kernel {
 // TODO: these embed kernels are objectively terrible
 __global__ void embed(int n_dim,
